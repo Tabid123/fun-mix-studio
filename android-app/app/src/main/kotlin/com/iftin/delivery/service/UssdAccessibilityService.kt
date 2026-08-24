@@ -428,15 +428,23 @@ class UssdAccessibilityService : AccessibilityService() {
                             submitPinOnce(delayMs = 1200L, source = "$source-rewrite$pinRewriteAttempts")
                         }
                     } else {
-                        // Never click Send on an unreadable/empty field. The previous
-                        // deadlock escape submitted anyway and could make Somnet return
-                        // "Invalid PIN format" when its dialog silently discarded the
-                        // programmatic write.
-                        pinWriteFailedForSession = true
-                        Log.e(TAG, "❌ submitPinOnce[$source] blocked after $pinRewriteAttempts rewrites — PIN is not visibly committed; Send will NOT be clicked")
+                        // FINAL FALLBACK (fixes "PIN entered but Send never pressed"):
+                        // after MAX rewrites, if the field visibly holds *something*
+                        // (masked bullets or any text), press Send instead of giving up.
+                        val filledLen = activeFieldFilledLength(rt)
+                        if (filledLen > 0) {
+                            pinSubmittedForSession = true
+                            submitCount++
+                            Log.i(TAG, "✅ submitPinOnce[$source] sending after $pinRewriteAttempts rewrites — field has data (len=$filledLen, unreadable but non-empty)")
+                            clickSendOrOkButton(rt)
+                        } else {
+                            pinWriteFailedForSession = true
+                            Log.e(TAG, "❌ submitPinOnce[$source] blocked after $pinRewriteAttempts rewrites — field is truly empty; Send will NOT be clicked")
+                        }
                     }
                     return@Runnable
                 }
+
                 pinSubmittedForSession = true
                 submitCount++
                 Log.i(TAG, "✅ submitPinOnce[$source] auto-sending verified PIN (submitCount=$submitCount)")
