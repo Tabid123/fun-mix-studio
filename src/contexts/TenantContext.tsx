@@ -31,15 +31,10 @@ interface TenantContextValue {
 const STORAGE_KEY = 'active_tenant_id';
 const PUBLIC_SLUG_KEY = 'public_tenant_slug';
 
-// Resolve the storefront tenant slug for anonymous visitors:
-// ?t=slug  →  saved slug  →  subdomain (slug.example.com)
-const resolvePublicSlug = (): string | null => {
+// Fallback storefront slug when the URL carries no `?t=`:
+// saved slug → subdomain (slug.example.com)
+const fallbackPublicSlug = (): string | null => {
   try {
-    const fromUrl = new URLSearchParams(window.location.search).get('t');
-    if (fromUrl) {
-      localStorage.setItem(PUBLIC_SLUG_KEY, fromUrl);
-      return fromUrl;
-    }
     const saved = localStorage.getItem(PUBLIC_SLUG_KEY);
     if (saved) return saved;
     const host = window.location.hostname;
