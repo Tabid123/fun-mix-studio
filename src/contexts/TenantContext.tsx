@@ -1,7 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { clearOfflineCache } from '@/lib/tenantSession';
-import { useSearchParams } from '@/lib/router-compat';
+import { useSearchParams, useLocation } from '@/lib/router-compat';
 
 export interface Tenant {
   id: string;
@@ -74,7 +74,12 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
   // The storefront slug from the current URL (`?t=slug`) — reactive, so
   // navigating between two reseller links never keeps the old tenant.
   const [searchParams] = useSearchParams();
+  const { pathname } = useLocation();
   const urlSlug = (searchParams.get('t') ?? '').trim().toLowerCase() || null;
+
+  // Auth screens are brand-neutral: never resolve a saved/subdomain slug there,
+  // otherwise the previous tenant's colors bleed into the login page.
+  const isAuthRoute = /^\/(reseller\/)?(login|auth|signup|register)/.test(pathname);
 
   useEffect(() => {
     if (!urlSlug) return;
@@ -83,7 +88,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
 
   // Anonymous storefront branding (logo + primary color) via public RPC
   const loadPublicTenant = useCallback(async () => {
-    const slug = urlSlug ?? fallbackPublicSlug();
+    const slug = urlSlug ?? (isAuthRoute ? null : fallbackPublicSlug());
     if (!slug) { setPublicTenant(null); setPublicLoading(false); return; }
     setPublicTenant(null);
     const { data, error } = await supabase.rpc('get_tenant_by_slug', { _slug: slug });
@@ -91,6 +96,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
     // flight — never re-apply the old tenant's branding in that case.
     const stillCurrent = urlSlug ? urlSlug === slug : fallbackPublicSlug() === slug;
     if (!stillCurrent) { setPublicTenant(null); setPublicLoading(false); return; }
+
     if (error || !data || !(data as any[]).length) {
       setPublicTenant(null);
       setPublicLoading(false);
@@ -178,6 +184,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
   // Otherwise a signed-in membership wins, so a *saved* slug can never
   // re-brand another tenant's dashboard.
   const tenant = useMemo(() => {
+    if (isAuthRoute) return null;
     if (urlSlug) {
       // Strict: only the tenant named in the link may render. If it can't be
       // resolved we show nothing rather than another tenant's shop.
@@ -193,7 +200,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
       publicTenant ??
       null
     );
-  }, [tenants, currentTenantId, publicTenant, urlSlug]);
+  }, [tenants, currentTenantId, publicTenant, urlSlug, isAuthRoute]);
 
   // Persist selection
   useEffect(() => {
