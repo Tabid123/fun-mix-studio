@@ -181,10 +181,17 @@ class UssdAccessibilityService : AccessibilityService() {
         // Timeout for expecting USSD flag (30 seconds - INCREASED from 15s)
         private const val EXPECTING_USSD_TIMEOUT_MS = 30000L
         private const val DEBOUNCE_MS = 800L
-        private const val CLICK_DELAY_MS = 2200L
-        private const val NON_PIN_SUBMIT_DELAY_MS = 3200L
+        // ===== UNIFIED TIMING (one behaviour for ALL providers) =====
+        // Every step (PIN or non-PIN, Somtel/Somnet/Amtel/Hormuud) uses the SAME
+        // write -> verify -> send delays. No provider-specific timing.
+        private const val SUBMIT_DELAY_MS = 2500L
+        private const val RECHECK_DELAY_MS = 1200L
+        // Legacy aliases kept so existing call sites stay readable.
+        private const val CLICK_DELAY_MS = SUBMIT_DELAY_MS
+        private const val NON_PIN_SUBMIT_DELAY_MS = SUBMIT_DELAY_MS
         // Extra wait applied when a scheduled Send finds the input field still empty.
-        private const val SUBMIT_RECHECK_DELAY_MS = 1500L
+        private const val SUBMIT_RECHECK_DELAY_MS = RECHECK_DELAY_MS
+
 
         /** Resource-id fragments that identify the dialer keypad (NOT a USSD dialog). */
         private val DIALPAD_ID_MARKERS = listOf(
