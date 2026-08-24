@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Loader2, PanelLeft, RefreshCw, Volume2, AlertTriangle, Home, ChevronRight } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 import { useTenant } from '@/contexts/TenantContext';
+import { clearTenantSelection } from '@/lib/tenantSession';
 import { ResellerSidebar, RESELLER_GROUPS } from '@/components/reseller/ResellerSidebar';
 import ResellerSimPins from '@/components/reseller/ResellerSimPins';
 import { ResellerStatCards } from '@/components/reseller/ResellerStatCards';
@@ -75,9 +76,13 @@ export default function ResellerDashboard() {
   }, [navigate]);
 
   const handleLogout = async () => {
+    // Drop the tenant selection first so the login page never keeps this
+    // tenant's branding or id for the next person signing in.
+    clearTenantSelection();
     await supabase.auth.signOut();
     navigate('/reseller/login', { replace: true });
   };
+
 
   const changeTab = (v: string) => {
     setActiveTab(v);
