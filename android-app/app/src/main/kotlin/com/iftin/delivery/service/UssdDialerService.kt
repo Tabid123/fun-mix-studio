@@ -165,7 +165,7 @@ class UssdDialerService : Service() {
         pin: String
     ): String {
         val amountStr = amount?.let {
-            val s = String.format("%.2f", it)
+            val s = String.format(Locale.US, "%.2f", it)
             // 11.60 -> 11*60   (USSD asterisk decimal). Drop *00 cents.
             if (s.endsWith(".00")) s.removeSuffix(".00") else s.replace('.', '*')
         } ?: ""
@@ -1352,7 +1352,7 @@ class UssdDialerService : Service() {
                 .edit()
                 .putString("current_pin_code", pinToUse)
                 .putString("current_receiver", order.receiverPhone)
-                .putString("current_topup_amount", order.topupAmount?.let { String.format("%.2f", it) } ?: "")
+                .putString("current_topup_amount", order.topupAmount?.let { String.format(Locale.US, "%.2f", it) } ?: "")
                 .putString("current_trigger_code", triggerCode)
                 .putString("current_provider", order.provider)
                 .putString("current_ussd_method", order.ussdMethod ?: "")

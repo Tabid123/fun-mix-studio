@@ -80,6 +80,14 @@ class UssdAccessibilityService : AccessibilityService() {
         val maskedTreeLength: Int = 0
     )
 
+    private enum class FlowResponseKind {
+        PIN,
+        AMOUNT,
+        RECEIVER,
+        MENU_CHOICE,
+        UNKNOWN
+    }
+
     companion object {
         private const val TAG = "UssdAccessibility"
         const val ACTION_USSD_CLICK_COMPLETE = "com.iftin.delivery.USSD_CLICK_COMPLETE"
@@ -1190,9 +1198,73 @@ class UssdAccessibilityService : AccessibilityService() {
 
     private fun looksLikeNumberedMenu(text: String): Boolean {
         if (text.isBlank()) return false
-        // Count occurrences of "1." / "2)" etc. — 2+ means it's a menu list.
-        val matches = Regex("(?m)(?:^|\\s)[1-9][.)]\\s+\\S").findAll(text).count()
+        // Count occurrences of "1.", "2)", "1 -", or carrier variants like
+        // "1 Haa". 2+ means it is a menu/choice list, not a value prompt.
+        val matches = Regex("(?m)(?:^|\\s)[1-9]\\s*[.)-]?\\s+\\S").findAll(text).count()
         return matches >= 2
+    }
+
+    private fun flowResponseKind(step: UssdFlowsClient.FlowStep): FlowResponseKind {
+        val template = step.responseTemplate.lowercase().trim()
+        val literal = template.trim('{', '}')
+        return when {
+            step.isPinField || template.contains("{pin}") || template.contains("{sim_password}") -> FlowResponseKind.PIN
+            template.contains("{amount}") || template.contains("{cost_price}") || template.contains("{topup_amount}") -> FlowResponseKind.AMOUNT
+            template.contains("{receiver}") || template.contains("{receiver_phone}") || template.contains("{phone}") || template.contains("{number}") -> FlowResponseKind.RECEIVER
+            literal.isNotEmpty() && literal.length <= 2 && literal.all(Char::isDigit) -> FlowResponseKind.MENU_CHOICE
+            else -> FlowResponseKind.UNKNOWN
+        }
+    }
+
+    private fun dialogLooksLikePinPrompt(text: String?): Boolean {
+        val lower = text.orEmpty().lowercase()
+        return lower.isNotBlank() && !looksLikeNumberedMenu(lower) &&
+            (lower.contains("pin") || lower.contains("password") || lower.contains("furaha") || lower.contains("sirta"))
+    }
+
+    private fun dialogLooksLikeAmountPrompt(text: String?): Boolean {
+        val lower = text.orEmpty().lowercase()
+        if (lower.isBlank() || looksLikeNumberedMenu(lower)) return false
+        return listOf(
+            "geli lacag", "lacagta", "qiimaha", "qiimo", "amount", "enter amount",
+            "dollar", "usd", "wadarta", "total", "mount"
+        ).any { lower.contains(it) }
+    }
+
+    private fun dialogLooksLikeReceiverPrompt(text: String?): Boolean {
+        val lower = text.orEmpty().lowercase()
+        if (lower.isBlank() || looksLikeNumberedMenu(lower)) return false
+        return listOf(
+            "geli mobil", "geli mobile", "mobilka", "mobile", "lambarka", "lambar",
+            "number", "phone", "taleefan", "telefoon", "receiver", "reciver",
+            "hubi mobil", "confirm number", "xaqiiji lambarka"
+        ).any { lower.contains(it) }
+    }
+
+    private fun dialogLooksLikeMenuChoicePrompt(text: String?): Boolean {
+        val lower = text.orEmpty().lowercase()
+        if (lower.isBlank()) return false
+        if (looksLikeNumberedMenu(lower)) return true
+        if (dialogLooksLikeAmountPrompt(lower) || dialogLooksLikeReceiverPrompt(lower) || dialogLooksLikePinPrompt(lower)) return false
+        return listOf(
+            "ma hubtaa", "mu hubtaa", "haa", "maya", "press 1", "riix 1",
+            "accept", "ogolow", "door", "xulo", "select", "continue", "sii wad",
+            "dirid lacag", "lacag dirid", "send money"
+        ).any { lower.contains(it) }
+    }
+
+    private fun isFlowStepCompatibleWithDialog(step: UssdFlowsClient.FlowStep, dialogText: String): Boolean {
+        val amountPrompt = dialogLooksLikeAmountPrompt(dialogText)
+        val receiverPrompt = dialogLooksLikeReceiverPrompt(dialogText)
+        val pinPrompt = dialogLooksLikePinPrompt(dialogText)
+        val menuPrompt = dialogLooksLikeMenuChoicePrompt(dialogText)
+        return when (flowResponseKind(step)) {
+            FlowResponseKind.PIN -> pinPrompt
+            FlowResponseKind.AMOUNT -> amountPrompt
+            FlowResponseKind.RECEIVER -> receiverPrompt
+            FlowResponseKind.MENU_CHOICE -> menuPrompt || (!amountPrompt && !receiverPrompt && !pinPrompt)
+            FlowResponseKind.UNKNOWN -> true
+        }
     }
 
     private fun matchesPendingPinFlowStep(dialogText: String?): Boolean {
@@ -1657,16 +1729,29 @@ class UssdAccessibilityService : AccessibilityService() {
                 lower.contains("password") ||
                 lower.contains("furaha")
         )
-        val matchedStep = flow.steps.firstOrNull { s ->
+        val unansweredSteps = flow.steps.filter { it.order !in completedFlowSteps }
+        val expectedNextOrder = (completedFlowSteps.maxOrNull() ?: 0) + 1
+        val keywordMatches = unansweredSteps.filter { s ->
             s.order !in completedFlowSteps &&
             s.keywords.isNotEmpty() &&
             s.keywords.any { kw -> lower.contains(kw.lowercase()) }
         }
-        val step = matchedStep ?: flow.steps.firstOrNull { s ->
-            s.order !in completedFlowSteps &&
+        val compatibleKeywordMatches = keywordMatches.filter { s -> isFlowStepCompatibleWithDialog(s, dialogText) }
+        if (keywordMatches.isNotEmpty() && compatibleKeywordMatches.isEmpty()) {
+            Log.w(
+                TAG,
+                "🛡️ Flow ${flow.triggerCode}: keyword match rejected by value-type guard. " +
+                    "matches=${keywordMatches.map { it.order }} dialog=${dialogText.take(120)}"
+            )
+        }
+        val matchedStep = compatibleKeywordMatches.firstOrNull { it.order == expectedNextOrder }
+            ?: compatibleKeywordMatches.minByOrNull { it.order }
+        val expectedStep = flow.steps.firstOrNull { it.order == expectedNextOrder }
+        val step = matchedStep ?: expectedStep?.takeIf { s ->
                 !s.isPinField &&
                 completedFlowSteps.isNotEmpty() &&
                 !looksLikePinDialog &&
+                isFlowStepCompatibleWithDialog(s, dialogText) &&
                 // A confirmation menu ("1. Haa / 2. Maya") sometimes exposes no
                 // EditText to Accessibility; still allow the numeric answer there.
                 (hasVisibleEditableInput(root) || isMenuList) &&
@@ -1690,6 +1775,11 @@ class UssdAccessibilityService : AccessibilityService() {
                 val nextOrder = (completedFlowSteps.maxOrNull() ?: 0) + 1
                 UssdFlowsClient.logUnmatchedAsync(flow.id, nextOrder, dialogText, deviceId)
             } catch (_: Exception) {}
+            return false
+        }
+
+        if (!isFlowStepCompatibleWithDialog(step, dialogText)) {
+            Log.w(TAG, "🛡️ Flow step #${step.order} blocked — response kind ${flowResponseKind(step)} does not match this dialog: ${dialogText.take(120)}")
             return false
         }
 
@@ -1918,11 +2008,14 @@ class UssdAccessibilityService : AccessibilityService() {
      *  "20" -> "20", "11.60" -> "11.60", "0.12" -> "0.12" */
     private fun formatAmountForUssd(raw: String): String {
         if (raw.isBlank()) return ""
-        val n = raw.toDoubleOrNull() ?: return raw
+        val cleaned = raw.trim()
+            .replace(',', '.')
+            .filter { it.isDigit() || it == '.' }
+        val n = cleaned.toDoubleOrNull() ?: return cleaned.ifBlank { raw.trim() }
         if (n == n.toLong().toDouble()) return n.toLong().toString()
         // EditText prompts expect a normal decimal number — NOT the asterisk
         // USSD-code form. e.g. "0.12" stays "0.12" so Somtel reads $0.12 (not $12).
-        return String.format("%.2f", n)
+        return String.format(java.util.Locale.US, "%.2f", n)
     }
     
     /**
