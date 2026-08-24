@@ -567,25 +567,21 @@ class UssdAccessibilityService : AccessibilityService() {
         val hasRealEditableField = candidates.any { it.isVisible && it.isEnabled && it.isEditable }
         val methods = mutableListOf<Pair<String, (AccessibilityNodeInfo, String) -> Boolean>>()
         if (hasRealEditableField) {
-            val provider = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getString("current_provider", "")
-                .orEmpty()
-            if (provider.contains("somnet", ignoreCase = true)) {
-                methods += "visible_ime_keypad" to { node: AccessibilityNodeInfo, pin: String ->
-                    writeWithVisibleImeKeypad(node, pin)
-                }
-            }
-            // Somnet's first PIN dialog visually accepts ACTION_SET_TEXT but its
-            // carrier TextWatcher can still receive an empty value. PASTE fires the
-            // same input/commit path as user typing; retain SET_TEXT as fallback.
+            // UNIFIED WRITE PATH — identical for every provider (no somnet/somtel branch).
+            // PASTE fires the same input/commit path as user typing; SET_TEXT is the
+            // fallback; the visible IME keypad is the LAST resort only when both fail.
             methods += "clipboard_paste" to { node: AccessibilityNodeInfo, pin: String ->
                 writeWithClipboardPaste(node, pin, requireFocus = true)
             }
             methods += "action_set_text" to { node: AccessibilityNodeInfo, pin: String ->
                 writeWithActionSetText(node, pin)
             }
+            methods += "visible_ime_keypad" to { node: AccessibilityNodeInfo, pin: String ->
+                writeWithVisibleImeKeypad(node, pin)
+            }
             Log.d(TAG, "🧭 PIN path = ${methods.joinToString(" → ") { it.first }} (EditText present, package=$activePackage)")
         } else {
+
             pinWriteFailedForSession = true
             Log.w(TAG, "⚠️ safeEnterPin — no real editable field available, refusing gesture/click fallback for PIN entry")
             candidates.forEach { it.node.recycle() }
