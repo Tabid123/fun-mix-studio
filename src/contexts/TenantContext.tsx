@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { supabase } from '@/integrations/supabase/client';
+import { clearOfflineCache } from '@/lib/tenantSession';
 
 export interface Tenant {
   id: string;
@@ -107,6 +108,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
     setCurrentTenantId(null);
     setLogoUrl(null);
     setPublicTenant(null);
+    clearOfflineCache();
     try {
       localStorage.removeItem(STORAGE_KEY);
       localStorage.removeItem(PUBLIC_SLUG_KEY);
@@ -245,7 +247,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
     currentTenantId: tenant?.id ?? null,
     logoUrl,
     needsOnboarding: !!tenant && (!tenant.logo_url || /^Company-/i.test(tenant.name)),
-    switchTenant: (id: string) => setCurrentTenantId(id),
+    switchTenant: (id: string) => { clearOfflineCache(); setCurrentTenantId(id); },
     refreshTenants: loadTenants,
   };
 
