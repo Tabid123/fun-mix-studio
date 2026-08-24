@@ -478,14 +478,39 @@ class UssdAccessibilityService : AccessibilityService() {
             try { best.node.refresh() } catch (_: Exception) {}
             val actual = best.node.text?.toString()?.trim().orEmpty()
             val maskedValue = actual.length == expected.length && actual.all { it == '•' || it == '*' }
-            // Only trust the selected EditText itself. A masked string elsewhere in
-            // the window (debug overlay, stale node, another field) must never unlock
-            // Send while the active PIN field is empty.
-            actual == expected || maskedValue
+            if (actual == expected || maskedValue) return true
+            // Password fields on some carrier dialogs (Somtel/Amtel) expose an EMPTY
+            // text while the bullets live on a sibling/label node. Accept that case
+            // when the masked length in this dialog matches what we typed — this is
+            // what previously blocked Send after a correct PIN entry.
+            if (best.isPassword && actual.isEmpty()) {
+                val maskedLen = findMaskedPinLengthInTree(root)
+                if (maskedLen == expected.length) {
+                    Log.i(TAG, "✅ Value committed via masked-length match (len=$maskedLen)")
+                    return true
+                }
+            }
+            false
         } finally {
             candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
         }
     }
+
+    /** Length of text currently present in the active editable field (masked or not). */
+    private fun activeFieldFilledLength(root: AccessibilityNodeInfo): Int {
+        val candidates = collectEditableFieldCandidates(root)
+        return try {
+            val best = selectBestEditableCandidate(candidates) ?: return 0
+            try { best.node.refresh() } catch (_: Exception) {}
+            val direct = best.node.text?.toString()?.trim()?.length ?: 0
+            if (direct > 0) direct else findMaskedPinLengthInTree(root)
+        } catch (_: Exception) {
+            0
+        } finally {
+            candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
+        }
+    }
+
 
     /**
      * Safe PIN entry: validates, clears existing text, writes exact PIN once.
