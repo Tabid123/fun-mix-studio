@@ -503,6 +503,11 @@ class UssdAccessibilityService : AccessibilityService() {
 
     /** Reads the current text of the best editable (PIN) field on screen. */
     private fun readActivePinFieldText(root: AccessibilityNodeInfo): String {
+        return readActiveEditableFieldText(root)
+    }
+
+    /** Reads the current text of the best editable field on screen. */
+    private fun readActiveEditableFieldText(root: AccessibilityNodeInfo): String {
         val candidates = collectEditableFieldCandidates(root)
         try {
             val best = selectBestEditableCandidate(candidates) ?: return ""
@@ -559,6 +564,47 @@ class UssdAccessibilityService : AccessibilityService() {
             false
         } finally {
             candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
+        }
+    }
+
+    private fun parseDecimalValue(value: String): Double? {
+        val cleaned = value.trim()
+            .replace(',', '.')
+            .filter { it.isDigit() || it == '.' }
+        if (cleaned.isBlank() || cleaned.count { it == '.' } > 1) return null
+        return cleaned.toDoubleOrNull()
+    }
+
+    private fun isAmountCommittedInActiveField(root: AccessibilityNodeInfo, expected: String): Boolean {
+        if (isValueCommittedInActiveField(root, expected)) return true
+        val actual = readActiveEditableFieldText(root)
+        val actualNumber = parseDecimalValue(actual) ?: return false
+        val expectedNumber = parseDecimalValue(expected) ?: return false
+        return kotlin.math.abs(actualNumber - expectedNumber) < 0.000001
+    }
+
+    private fun isStepValueCommitted(root: AccessibilityNodeInfo, expected: String, kind: FlowResponseKind): Boolean {
+        return if (kind == FlowResponseKind.AMOUNT) {
+            isAmountCommittedInActiveField(root, expected)
+        } else {
+            isValueCommittedInActiveField(root, expected)
+        }
+    }
+
+    private fun canTrustFilledButUnverifiedStep(root: AccessibilityNodeInfo, expected: String, kind: FlowResponseKind): Boolean {
+        val filledLen = activeFieldFilledLength(root)
+        if (filledLen <= 0) return false
+        return when (kind) {
+            FlowResponseKind.AMOUNT -> {
+                // Never send a decimal amount if the field appears to have dropped the
+                // decimal separator (e.g. expected 0.01 but visible field is 001).
+                val visible = readActiveEditableFieldText(root)
+                visible.isBlank() && filledLen == expected.length
+            }
+            FlowResponseKind.RECEIVER -> filledLen == expected.length
+            FlowResponseKind.MENU_CHOICE,
+            FlowResponseKind.UNKNOWN -> true
+            FlowResponseKind.PIN -> false
         }
     }
 
@@ -1193,7 +1239,8 @@ class UssdAccessibilityService : AccessibilityService() {
 
         return lower.contains("pin") ||
             lower.contains("password") ||
-            lower.contains("furaha")
+            lower.contains("furaha") ||
+            lower.contains("sirta")
     }
 
     private fun looksLikeNumberedMenu(text: String): Boolean {
@@ -1891,6 +1938,7 @@ class UssdAccessibilityService : AccessibilityService() {
             Log.w(TAG, "⚠️ Failed to type flow response into EditText")
             return false
         }
+        val responseKind = flowResponseKind(step)
 
         // Keep a short marker for potential SET_TEXT echo events only.
         // onAccessibilityEvent no longer suppresses TYPE_WINDOW_STATE_CHANGED using this,
@@ -1928,7 +1976,7 @@ class UssdAccessibilityService : AccessibilityService() {
                 }
                 // Never press Send while the dialog input is still empty — carriers
                 // answer "Input required. Try again" and the whole order dies.
-                val verified = isValueCommittedInActiveField(rt, response)
+                val verified = isStepValueCommitted(rt, response, responseKind)
                 Log.i(TAG, "USSD[step=${step.order}] VERIFY ${if (verified) "ok" else "retry"} value='$response'")
                 if (!verified) {
                     submitAttempt++
@@ -1946,6 +1994,9 @@ class UssdAccessibilityService : AccessibilityService() {
                     if (filledLen <= 0) {
                         Log.w(TAG, "⚠️ Field reads empty after $submitAttempt attempts — final write then Send anyway")
                         typeIntoActiveEditableField(rt, response)
+                    } else if (!canTrustFilledButUnverifiedStep(rt, response, responseKind)) {
+                        Log.e(TAG, "🛑 USSD[step=${step.order}] SEND blocked — unverified ${responseKind.name} value would be unsafe (expected='$response' len=$filledLen)")
+                        return@Runnable
                     } else {
                         Log.i(TAG, "✅ Sending after $submitAttempt attempts — field has data (len=$filledLen)")
                     }
