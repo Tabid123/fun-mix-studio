@@ -234,6 +234,10 @@ class UssdAccessibilityService : AccessibilityService() {
     // True while a scheduled write→verify→send sequence is pending. While set, the
     // generic auto-click loop must never press Send (prevented Somnet early clicks).
     @Volatile private var awaitingScheduledSubmit = false
+    // Signature (normalized dialog text) of the dialog a scheduled submit belongs to.
+    // A pending runnable must NEVER retype its old value into a NEW dialog — that is
+    // what made Somnet type the previous step's value ("5516") into "Geli lacagta".
+    @Volatile private var submitDialogSignature = ""
 
     // Delayed generic confirm runnable from onAccessibilityEvent.
     // Must be cancellable when a PIN dialog appears.
@@ -387,6 +391,7 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         scheduledSubmitRunnable = null
         awaitingScheduledSubmit = false
+        submitDialogSignature = ""
         multiDialogRunnable?.let { handler.removeCallbacks(it) }
         multiDialogRunnable = null
         isProcessingDialog = false
@@ -408,10 +413,18 @@ class UssdAccessibilityService : AccessibilityService() {
         }
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         awaitingScheduledSubmit = true
+        val pinSignature = dialogSignature(rootInActiveWindow)
+        submitDialogSignature = pinSignature
         lateinit var rRef: Runnable
         val r = Runnable {
             val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
             try {
+                // Stale-dialog guard: never write/send into a dialog that already changed.
+                val liveSignature = dialogSignature(rt)
+                if (pinSignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != pinSignature) {
+                    Log.w(TAG, "🚫 submitPinOnce[$source] dropped — dialog changed")
+                    return@Runnable
+                }
                 if (!pinFilledForSession || !pinVerifiedForSession || pinWriteFailedForSession) {
                     Log.w(TAG, "✋ submitPinOnce[$source] aborted at runtime — PIN verification lost")
                     return@Runnable
@@ -490,6 +503,17 @@ class UssdAccessibilityService : AccessibilityService() {
         return isValueCommittedInActiveField(root, expected)
     }
 
+    /** Normalized dialog signature — used to bind a scheduled submit to ONE dialog. */
+    private fun dialogSignature(root: AccessibilityNodeInfo?): String {
+        if (root == null) return ""
+        val raw = try { extractDialogText(root) ?: "" } catch (_: Exception) { "" }
+        return raw.lowercase().replace(Regex("[^a-z]"), "").take(60)
+    }
+
+    /** Digits/decimal-only form so "0.01", "0,01", " 0.01 " all compare equal. */
+    private fun normalizeFieldValue(v: String): String =
+        v.replace(',', '.').filter { it.isDigit() || it == '.' }
+
     /** True when the active EditText really holds [expected] (or its masked form). */
     private fun isValueCommittedInActiveField(root: AccessibilityNodeInfo, expected: String): Boolean {
         if (expected.isBlank()) return false
@@ -500,6 +524,10 @@ class UssdAccessibilityService : AccessibilityService() {
             val actual = best.node.text?.toString()?.trim().orEmpty()
             val maskedValue = actual.length == expected.length && actual.all { it == '•' || it == '*' }
             if (actual == expected || maskedValue) return true
+            // Carriers may re-render the value with a different separator/padding.
+            val na = normalizeFieldValue(actual)
+            val ne = normalizeFieldValue(expected)
+            if (ne.isNotEmpty() && na == ne) return true
             // Password fields on some carrier dialogs (Somtel/Amtel) expose an EMPTY
             // text while the bullets live on a sibling/label node. Accept that case
             // when the masked length in this dialog matches what we typed — this is
@@ -1356,6 +1384,15 @@ class UssdAccessibilityService : AccessibilityService() {
             return
         }
         if (dialogFingerprint.isNotBlank()) {
+            // A genuinely NEW dialog page invalidates any pending submit from the
+            // previous page — otherwise its retype writes the old value here.
+            if (lastDialogFingerprint.isNotBlank() && dialogFingerprint != lastDialogFingerprint && scheduledSubmitRunnable != null) {
+                scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+                scheduledSubmitRunnable = null
+                awaitingScheduledSubmit = false
+                submitDialogSignature = ""
+                Log.d(TAG, "🧹 New dialog page — dropped pending submit from previous page")
+            }
             lastDialogFingerprint = dialogFingerprint
         }
 
@@ -1792,10 +1829,11 @@ class UssdAccessibilityService : AccessibilityService() {
         )
 
         // Schedule a single Send/OK click for this non-PIN step.
-        // Reuse the same serialized scheduler — but allow it to fire even after
-        // a previous non-PIN submit, since each menu page = its own submit.
-        // For non-PIN steps we use a fresh runnable that doesn't gate on pinSubmittedForSession.
+        // Bound to THIS dialog: a pending runnable from an earlier step must never
+        // retype its old value into a newer dialog (Somnet "wrong value first" bug).
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+        val mySignature = dialogSignature(root)
+        submitDialogSignature = mySignature
         var submitAttempt = 0
         lateinit var submitRunnable: Runnable
         awaitingScheduledSubmit = true
@@ -1803,31 +1841,39 @@ class UssdAccessibilityService : AccessibilityService() {
             val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
             var rescheduled = false
             try {
+                // Stale-dialog guard: the screen already moved on — do nothing.
+                val liveSignature = dialogSignature(rt)
+                if (mySignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != mySignature) {
+                    Log.w(TAG, "🚫 Stale submit dropped — dialog changed (was='${mySignature.take(24)}' now='${liveSignature.take(24)}')")
+                    return@Runnable
+                }
                 // Never press Send while the dialog input is still empty — carriers
                 // answer "Input required. Try again" and the whole order dies.
                 if (!isValueCommittedInActiveField(rt, response)) {
                     submitAttempt++
-                    if (submitAttempt <= 2) {
+                    if (submitAttempt <= 4) {
                         Log.w(TAG, "⏳ Field not committed yet (attempt $submitAttempt) — retyping '$response' and waiting")
                         typeIntoActiveEditableField(rt, response)
                         handler.postDelayed(submitRunnable, RECHECK_DELAY_MS)
                         rescheduled = true
                         return@Runnable
                     }
-                    // Same final fallback as the PIN path: if the field visibly holds
-                    // data (even unreadable/masked), press Send instead of giving up.
+                    // Never stall the order: after the retries, press Send as long as
+                    // the field visibly holds data; if it reads empty, write once more
+                    // and still press Send (unreadable fields must not block the flow).
                     val filledLen = activeFieldFilledLength(rt)
                     if (filledLen <= 0) {
-                        Log.e(TAG, "❌ Skipping Send — input field still empty after $submitAttempt attempts")
-                        return@Runnable
+                        Log.w(TAG, "⚠️ Field reads empty after $submitAttempt attempts — final write then Send anyway")
+                        typeIntoActiveEditableField(rt, response)
+                    } else {
+                        Log.i(TAG, "✅ Sending after $submitAttempt attempts — field has data (len=$filledLen)")
                     }
-                    Log.i(TAG, "✅ Sending after $submitAttempt attempts — field has data (len=$filledLen)")
                 }
                 submitCount++
                 Log.d(TAG, "📨 Non-PIN flow submit step=${step.order} submitCount=$submitCount")
                 clickSendOrOkButton(rt)
             } finally {
-                if (!rescheduled) {
+                if (!rescheduled && scheduledSubmitRunnable === submitRunnable) {
                     awaitingScheduledSubmit = false
                     scheduledSubmitRunnable = null
                 }
