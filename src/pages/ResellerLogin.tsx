@@ -6,6 +6,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { toast } from '@/hooks/use-toast';
+import { clearTenantSelection } from '@/lib/tenantSession';
 import { Store, Loader2 } from 'lucide-react';
 
 const MANAGER_ROLES = ['owner', 'admin', 'manager'];
@@ -24,6 +25,7 @@ const ResellerLogin = () => {
       return;
     }
     setLoading(true);
+    clearTenantSelection();
     try {
       const { data, error } = await supabase.auth.signInWithPassword({
         email: email.trim().toLowerCase(),
@@ -48,6 +50,7 @@ const ResellerLogin = () => {
       if (roleErr) throw roleErr;
 
       if (superRole) {
+        clearTenantSelection();
         await supabase.auth.signOut();
         toast({
           title: 'Ma lihid fasax',
@@ -63,6 +66,7 @@ const ResellerLogin = () => {
       );
 
       if (!manager?.tenant_id) {
+        clearTenantSelection();
         await supabase.auth.signOut();
         toast({
           title: 'Ma lihid fasax',

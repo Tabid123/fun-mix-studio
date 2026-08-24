@@ -79,6 +79,9 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
     const slug = resolvePublicSlug();
     if (!slug) { setPublicTenant(null); setPublicLoading(false); return; }
     const { data, error } = await supabase.rpc('get_tenant_by_slug', { _slug: slug });
+    // A logout/clear may have wiped the saved slug while this request was in
+    // flight — never re-apply the old tenant's branding in that case.
+    if (resolvePublicSlug() !== slug) { setPublicTenant(null); setPublicLoading(false); return; }
     if (error || !data || !(data as any[]).length) {
       setPublicTenant(null);
       setPublicLoading(false);
@@ -98,10 +101,23 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
     setPublicLoading(false);
   }, []);
 
+
+  const clearTenantState = useCallback(() => {
+    setTenants([]);
+    setCurrentTenantId(null);
+    setLogoUrl(null);
+    setPublicTenant(null);
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(PUBLIC_SLUG_KEY);
+    } catch { /* ignore */ }
+  }, []);
+
   const loadTenants = useCallback(async () => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session?.user) {
-      setTenants([]);
+      // Signed out: never keep the previous tenant's id or branding around.
+      clearTenantState();
       setMembershipLoading(false);
       return;
     }
@@ -124,7 +140,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
     setTenants(list);
     setCurrentTenantId((prev) => (prev && list.some((t) => t.id === prev) ? prev : list[0]?.id ?? null));
     setMembershipLoading(false);
-  }, []);
+  }, [clearTenantState]);
 
   useEffect(() => {
     setLoading(publicLoading || membershipLoading);
@@ -133,14 +149,28 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
   useEffect(() => {
     loadTenants();
     loadPublicTenant();
-    const { data: sub } = supabase.auth.onAuthStateChange(() => {
-      setTimeout(() => { loadTenants(); }, 0);
+    const { data: sub } = supabase.auth.onAuthStateChange((event) => {
+      if (event === 'SIGNED_OUT') {
+        clearTenantState();
+        setMembershipLoading(false);
+        setPublicLoading(false);
+        return;
+      }
+      if (event === 'SIGNED_IN' || event === 'USER_UPDATED' || event === 'INITIAL_SESSION') {
+        setTimeout(() => { loadTenants(); }, 0);
+      }
     });
     return () => sub.subscription.unsubscribe();
-  }, [loadTenants, loadPublicTenant]);
+  }, [loadTenants, loadPublicTenant, clearTenantState]);
 
+  // A signed-in membership always wins over the anonymous storefront tenant,
+  // so a saved ?t=slug can never re-brand another tenant's dashboard.
   const tenant = useMemo(
-    () => publicTenant ?? tenants.find((t) => t.id === currentTenantId) ?? tenants[0] ?? null,
+    () =>
+      tenants.find((t) => t.id === currentTenantId) ??
+      tenants[0] ??
+      publicTenant ??
+      null,
     [tenants, currentTenantId, publicTenant]
   );
 
@@ -148,8 +178,10 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
   useEffect(() => {
     try {
       if (currentTenantId) localStorage.setItem(STORAGE_KEY, currentTenantId);
+      else localStorage.removeItem(STORAGE_KEY);
     } catch { /* ignore */ }
   }, [currentTenantId]);
+
 
   // Resolve logo (private bucket → signed URL)
   useEffect(() => {
@@ -168,7 +200,15 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
   // Dynamic branding CSS variables
   useEffect(() => {
     const root = document.documentElement;
-    const primary = tenant?.primary_color || '#0099ff';
+    // No tenant (e.g. after logout) → drop the overrides so the app defaults return.
+    if (!tenant) {
+      root.style.removeProperty('--primary');
+      root.style.removeProperty('--ring');
+      root.style.removeProperty('--tenant-primary');
+      root.style.removeProperty('--tenant-secondary');
+      return;
+    }
+    const primary = tenant.primary_color || '#0099ff';
     const match = /^#([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(primary);
     if (match) {
       const r = parseInt(match[1], 16) / 255;
@@ -188,21 +228,27 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
       const s = delta === 0 ? 0 : delta / (1 - Math.abs(2 * l - 1));
       root.style.setProperty('--primary', `${Math.round(h)} ${Math.round(s * 100)}% ${Math.round(l * 100)}%`);
       root.style.setProperty('--ring', `${Math.round(h)} ${Math.round(s * 100)}% ${Math.round(l * 100)}%`);
+    } else {
+      root.style.removeProperty('--primary');
+      root.style.removeProperty('--ring');
     }
     root.style.setProperty('--tenant-primary', primary);
-    root.style.setProperty('--tenant-secondary', tenant?.secondary_color || '#ffffff');
-  }, [tenant?.primary_color, tenant?.secondary_color]);
+    root.style.setProperty('--tenant-secondary', tenant.secondary_color || '#ffffff');
+  }, [tenant]);
 
   const value: TenantContextValue = {
     loading,
     tenant,
     tenants,
-    currentTenantId,
+    // Only ever hand out an id that belongs to the resolved tenant, so tabs
+    // can't read/write another tenant's rows from a stale saved id.
+    currentTenantId: tenant?.id ?? null,
     logoUrl,
     needsOnboarding: !!tenant && (!tenant.logo_url || /^Company-/i.test(tenant.name)),
     switchTenant: (id: string) => setCurrentTenantId(id),
     refreshTenants: loadTenants,
   };
+
 
   return <TenantContext.Provider value={value}>{children}</TenantContext.Provider>;
 };

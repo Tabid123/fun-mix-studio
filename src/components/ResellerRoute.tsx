@@ -3,6 +3,7 @@ import { useNavigate } from "@/lib/router-compat";
 import { Loader2 } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from '@/hooks/use-toast';
+import { clearTenantSelection } from '@/lib/tenantSession';
 
 const MANAGER_ROLES = ['owner', 'admin', 'manager'];
 
@@ -20,7 +21,7 @@ const ResellerRoute = ({ children }: { children: React.ReactNode }) => {
 
     const check = async () => {
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { navigate('/reseller/login', { replace: true }); return; }
+      if (!user) { clearTenantSelection(); navigate('/reseller/login', { replace: true }); return; }
 
       const [{ data: membership, error: membershipError }, { data: superRole }] = await Promise.all([
         supabase
@@ -39,6 +40,7 @@ const ResellerRoute = ({ children }: { children: React.ReactNode }) => {
       if (!active) return;
 
       if (superRole) {
+        clearTenantSelection();
         await supabase.auth.signOut();
         toast({
           title: 'Reseller login',
@@ -77,6 +79,7 @@ const ResellerRoute = ({ children }: { children: React.ReactNode }) => {
         description: 'Kaliya maamulaha tenant-ka ayaa geli kara reseller dashboard-ka',
         variant: 'destructive',
       });
+      clearTenantSelection();
       await supabase.auth.signOut();
       navigate('/reseller/login', { replace: true });
     };
@@ -84,7 +87,10 @@ const ResellerRoute = ({ children }: { children: React.ReactNode }) => {
     check();
 
     const { data: sub } = supabase.auth.onAuthStateChange((event) => {
-      if (event === 'SIGNED_OUT') navigate('/reseller/login', { replace: true });
+      if (event === 'SIGNED_OUT') {
+        clearTenantSelection();
+        navigate('/reseller/login', { replace: true });
+      }
     });
 
     return () => { active = false; sub.subscription.unsubscribe(); };
