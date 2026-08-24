@@ -402,7 +402,7 @@ class UssdAccessibilityService : AccessibilityService() {
      * Schedule a single Send/OK click for the current PIN entry.
      * Idempotent: only one submit per session, cancels any prior scheduled runnable.
      */
-    private fun submitPinOnce(delayMs: Long = 300L, source: String) {
+    private fun submitPinOnce(delayMs: Long = 300L, source: String, onSubmitted: (() -> Unit)? = null) {
         if (pinSubmittedForSession) {
             Log.d(TAG, "🛑 submitPinOnce[$source] ignored — already submitted (submitCount=$submitCount)")
             return
@@ -453,10 +453,14 @@ class UssdAccessibilityService : AccessibilityService() {
                         // (masked bullets or any text), press Send instead of giving up.
                         val filledLen = activeFieldFilledLength(rt)
                         if (filledLen > 0) {
-                            pinSubmittedForSession = true
-                            submitCount++
-                            Log.i(TAG, "✅ submitPinOnce[$source] sending after $pinRewriteAttempts rewrites — field has data (len=$filledLen, unreadable but non-empty)")
-                            clickSendOrOkButton(rt)
+                            Log.i(TAG, "USSD[$source] SEND fallback — field has data after $pinRewriteAttempts rewrites (len=$filledLen)")
+                            if (clickSendOrOkButton(rt, allowScheduledSubmit = true, source = source)) {
+                                pinSubmittedForSession = true
+                                submitCount++
+                                onSubmitted?.invoke()
+                            } else {
+                                Log.w(TAG, "USSD[$source] SEND failed — no Send/OK button clicked")
+                            }
                         } else {
                             pinWriteFailedForSession = true
                             Log.e(TAG, "❌ submitPinOnce[$source] blocked after $pinRewriteAttempts rewrites — field is truly empty; Send will NOT be clicked")
@@ -465,10 +469,15 @@ class UssdAccessibilityService : AccessibilityService() {
                     return@Runnable
                 }
 
-                pinSubmittedForSession = true
-                submitCount++
-                Log.i(TAG, "✅ submitPinOnce[$source] auto-sending verified PIN (submitCount=$submitCount)")
-                clickSendOrOkButton(rt)
+                Log.i(TAG, "USSD[$source] SEND verified PIN")
+                if (clickSendOrOkButton(rt, allowScheduledSubmit = true, source = source)) {
+                    pinSubmittedForSession = true
+                    submitCount++
+                    onSubmitted?.invoke()
+                    Log.i(TAG, "✅ submitPinOnce[$source] auto-sent verified PIN (submitCount=$submitCount)")
+                } else {
+                    Log.w(TAG, "USSD[$source] SEND failed — no Send/OK button clicked")
+                }
             } finally {
                 rt.recycle()
                 // A rewrite may have scheduled a NEW submit runnable — don't clear the
