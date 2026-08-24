@@ -107,7 +107,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
       role: 'visitor',
     });
     setPublicLoading(false);
-  }, []);
+  }, [urlSlug]);
 
 
   const clearTenantState = useCallback(() => {
