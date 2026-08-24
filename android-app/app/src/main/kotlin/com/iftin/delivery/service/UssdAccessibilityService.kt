@@ -386,6 +386,7 @@ class UssdAccessibilityService : AccessibilityService() {
         pendingConfirmRunnable = null
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         scheduledSubmitRunnable = null
+        awaitingScheduledSubmit = false
         multiDialogRunnable?.let { handler.removeCallbacks(it) }
         multiDialogRunnable = null
         isProcessingDialog = false
@@ -406,8 +407,9 @@ class UssdAccessibilityService : AccessibilityService() {
             return
         }
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+        awaitingScheduledSubmit = true
         val r = Runnable {
-            val rt = rootInActiveWindow ?: return@Runnable
+            val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
             try {
                 if (!pinFilledForSession || !pinVerifiedForSession || pinWriteFailedForSession) {
                     Log.w(TAG, "✋ submitPinOnce[$source] aborted at runtime — PIN verification lost")
@@ -456,6 +458,7 @@ class UssdAccessibilityService : AccessibilityService() {
             } finally {
                 rt.recycle()
                 scheduledSubmitRunnable = null
+                awaitingScheduledSubmit = false
             }
         }
         scheduledSubmitRunnable = r
@@ -2207,6 +2210,13 @@ class UssdAccessibilityService : AccessibilityService() {
     }
 
     private fun shouldSuppressAutoClickForDialog(root: AccessibilityNodeInfo, dialogText: String?): Boolean {
+        // A scheduled write -> verify -> send sequence owns this dialog. The generic
+        // auto-click loop must stay out of the way until it has run, otherwise Send
+        // can fire before the value is typed (the Somnet symptom).
+        if (awaitingScheduledSubmit) {
+            Log.i(TAG, "🛑 Suppressing auto-click — scheduled submit is pending")
+            return true
+        }
         if (shouldHardStopForPinStage(root, dialogText)) {
             return true
         }
