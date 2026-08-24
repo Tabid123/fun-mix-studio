@@ -231,6 +231,10 @@ class UssdAccessibilityService : AccessibilityService() {
     @Volatile private var setTextSuppressUntilMs = 0L
     // Single scheduled submit Runnable — replaces all parallel postDelayed submits
     private var scheduledSubmitRunnable: Runnable? = null
+    // True while a scheduled write→verify→send sequence is pending. While set, the
+    // generic auto-click loop must never press Send (prevented Somnet early clicks).
+    @Volatile private var awaitingScheduledSubmit = false
+
     // Delayed generic confirm runnable from onAccessibilityEvent.
     // Must be cancellable when a PIN dialog appears.
     private var pendingConfirmRunnable: Runnable? = null
