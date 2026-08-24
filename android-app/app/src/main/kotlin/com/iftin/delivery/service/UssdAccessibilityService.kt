@@ -181,10 +181,17 @@ class UssdAccessibilityService : AccessibilityService() {
         // Timeout for expecting USSD flag (30 seconds - INCREASED from 15s)
         private const val EXPECTING_USSD_TIMEOUT_MS = 30000L
         private const val DEBOUNCE_MS = 800L
-        private const val CLICK_DELAY_MS = 2200L
-        private const val NON_PIN_SUBMIT_DELAY_MS = 3200L
+        // ===== UNIFIED TIMING (one behaviour for ALL providers) =====
+        // Every step (PIN or non-PIN, Somtel/Somnet/Amtel/Hormuud) uses the SAME
+        // write -> verify -> send delays. No provider-specific timing.
+        private const val SUBMIT_DELAY_MS = 2500L
+        private const val RECHECK_DELAY_MS = 1200L
+        // Legacy aliases kept so existing call sites stay readable.
+        private const val CLICK_DELAY_MS = SUBMIT_DELAY_MS
+        private const val NON_PIN_SUBMIT_DELAY_MS = SUBMIT_DELAY_MS
         // Extra wait applied when a scheduled Send finds the input field still empty.
-        private const val SUBMIT_RECHECK_DELAY_MS = 1500L
+        private const val SUBMIT_RECHECK_DELAY_MS = RECHECK_DELAY_MS
+
 
         /** Resource-id fragments that identify the dialer keypad (NOT a USSD dialog). */
         private val DIALPAD_ID_MARKERS = listOf(
@@ -224,6 +231,10 @@ class UssdAccessibilityService : AccessibilityService() {
     @Volatile private var setTextSuppressUntilMs = 0L
     // Single scheduled submit Runnable — replaces all parallel postDelayed submits
     private var scheduledSubmitRunnable: Runnable? = null
+    // True while a scheduled write→verify→send sequence is pending. While set, the
+    // generic auto-click loop must never press Send (prevented Somnet early clicks).
+    @Volatile private var awaitingScheduledSubmit = false
+
     // Delayed generic confirm runnable from onAccessibilityEvent.
     // Must be cancellable when a PIN dialog appears.
     private var pendingConfirmRunnable: Runnable? = null
@@ -375,6 +386,7 @@ class UssdAccessibilityService : AccessibilityService() {
         pendingConfirmRunnable = null
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         scheduledSubmitRunnable = null
+        awaitingScheduledSubmit = false
         multiDialogRunnable?.let { handler.removeCallbacks(it) }
         multiDialogRunnable = null
         isProcessingDialog = false
@@ -395,8 +407,10 @@ class UssdAccessibilityService : AccessibilityService() {
             return
         }
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+        awaitingScheduledSubmit = true
+        lateinit var rRef: Runnable
         val r = Runnable {
-            val rt = rootInActiveWindow ?: return@Runnable
+            val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
             try {
                 if (!pinFilledForSession || !pinVerifiedForSession || pinWriteFailedForSession) {
                     Log.w(TAG, "✋ submitPinOnce[$source] aborted at runtime — PIN verification lost")
@@ -421,24 +435,38 @@ class UssdAccessibilityService : AccessibilityService() {
                             submitPinOnce(delayMs = 1200L, source = "$source-rewrite$pinRewriteAttempts")
                         }
                     } else {
-                        // Never click Send on an unreadable/empty field. The previous
-                        // deadlock escape submitted anyway and could make Somnet return
-                        // "Invalid PIN format" when its dialog silently discarded the
-                        // programmatic write.
-                        pinWriteFailedForSession = true
-                        Log.e(TAG, "❌ submitPinOnce[$source] blocked after $pinRewriteAttempts rewrites — PIN is not visibly committed; Send will NOT be clicked")
+                        // FINAL FALLBACK (fixes "PIN entered but Send never pressed"):
+                        // after MAX rewrites, if the field visibly holds *something*
+                        // (masked bullets or any text), press Send instead of giving up.
+                        val filledLen = activeFieldFilledLength(rt)
+                        if (filledLen > 0) {
+                            pinSubmittedForSession = true
+                            submitCount++
+                            Log.i(TAG, "✅ submitPinOnce[$source] sending after $pinRewriteAttempts rewrites — field has data (len=$filledLen, unreadable but non-empty)")
+                            clickSendOrOkButton(rt)
+                        } else {
+                            pinWriteFailedForSession = true
+                            Log.e(TAG, "❌ submitPinOnce[$source] blocked after $pinRewriteAttempts rewrites — field is truly empty; Send will NOT be clicked")
+                        }
                     }
                     return@Runnable
                 }
+
                 pinSubmittedForSession = true
                 submitCount++
                 Log.i(TAG, "✅ submitPinOnce[$source] auto-sending verified PIN (submitCount=$submitCount)")
                 clickSendOrOkButton(rt)
             } finally {
                 rt.recycle()
-                scheduledSubmitRunnable = null
+                // A rewrite may have scheduled a NEW submit runnable — don't clear the
+                // pending flag in that case, or the generic auto-click could sneak in.
+                if (scheduledSubmitRunnable === rRef) {
+                    scheduledSubmitRunnable = null
+                    awaitingScheduledSubmit = false
+                }
             }
         }
+        rRef = r
         scheduledSubmitRunnable = r
         handler.postDelayed(r, delayMs)
     }
@@ -471,14 +499,39 @@ class UssdAccessibilityService : AccessibilityService() {
             try { best.node.refresh() } catch (_: Exception) {}
             val actual = best.node.text?.toString()?.trim().orEmpty()
             val maskedValue = actual.length == expected.length && actual.all { it == '•' || it == '*' }
-            // Only trust the selected EditText itself. A masked string elsewhere in
-            // the window (debug overlay, stale node, another field) must never unlock
-            // Send while the active PIN field is empty.
-            actual == expected || maskedValue
+            if (actual == expected || maskedValue) return true
+            // Password fields on some carrier dialogs (Somtel/Amtel) expose an EMPTY
+            // text while the bullets live on a sibling/label node. Accept that case
+            // when the masked length in this dialog matches what we typed — this is
+            // what previously blocked Send after a correct PIN entry.
+            if (best.isPassword && actual.isEmpty()) {
+                val maskedLen = findMaskedPinLengthInTree(root)
+                if (maskedLen == expected.length) {
+                    Log.i(TAG, "✅ Value committed via masked-length match (len=$maskedLen)")
+                    return true
+                }
+            }
+            false
         } finally {
             candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
         }
     }
+
+    /** Length of text currently present in the active editable field (masked or not). */
+    private fun activeFieldFilledLength(root: AccessibilityNodeInfo): Int {
+        val candidates = collectEditableFieldCandidates(root)
+        return try {
+            val best = selectBestEditableCandidate(candidates) ?: return 0
+            try { best.node.refresh() } catch (_: Exception) {}
+            val direct = best.node.text?.toString()?.trim()?.length ?: 0
+            if (direct > 0) direct else findMaskedPinLengthInTree(root)
+        } catch (_: Exception) {
+            0
+        } finally {
+            candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
+        }
+    }
+
 
     /**
      * Safe PIN entry: validates, clears existing text, writes exact PIN once.
@@ -527,25 +580,21 @@ class UssdAccessibilityService : AccessibilityService() {
         val hasRealEditableField = candidates.any { it.isVisible && it.isEnabled && it.isEditable }
         val methods = mutableListOf<Pair<String, (AccessibilityNodeInfo, String) -> Boolean>>()
         if (hasRealEditableField) {
-            val provider = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getString("current_provider", "")
-                .orEmpty()
-            if (provider.contains("somnet", ignoreCase = true)) {
-                methods += "visible_ime_keypad" to { node: AccessibilityNodeInfo, pin: String ->
-                    writeWithVisibleImeKeypad(node, pin)
-                }
-            }
-            // Somnet's first PIN dialog visually accepts ACTION_SET_TEXT but its
-            // carrier TextWatcher can still receive an empty value. PASTE fires the
-            // same input/commit path as user typing; retain SET_TEXT as fallback.
+            // UNIFIED WRITE PATH — identical for every provider (no somnet/somtel branch).
+            // PASTE fires the same input/commit path as user typing; SET_TEXT is the
+            // fallback; the visible IME keypad is the LAST resort only when both fail.
             methods += "clipboard_paste" to { node: AccessibilityNodeInfo, pin: String ->
                 writeWithClipboardPaste(node, pin, requireFocus = true)
             }
             methods += "action_set_text" to { node: AccessibilityNodeInfo, pin: String ->
                 writeWithActionSetText(node, pin)
             }
+            methods += "visible_ime_keypad" to { node: AccessibilityNodeInfo, pin: String ->
+                writeWithVisibleImeKeypad(node, pin)
+            }
             Log.d(TAG, "🧭 PIN path = ${methods.joinToString(" → ") { it.first }} (EditText present, package=$activePackage)")
         } else {
+
             pinWriteFailedForSession = true
             Log.w(TAG, "⚠️ safeEnterPin — no real editable field available, refusing gesture/click fallback for PIN entry")
             candidates.forEach { it.node.recycle() }
@@ -1658,11 +1707,9 @@ class UssdAccessibilityService : AccessibilityService() {
                 dialogText = dialogText.take(200),
                 isPin = true
             )
-            // Somnet opens with the PIN prompt; allow its first-dialog input watcher
-            // extra time to commit before Send. Somtel remains on the proven delay.
-            val provider = prefs.getString("current_provider", "").orEmpty()
-            val pinSubmitDelay = if (provider.contains("somnet", ignoreCase = true)) 3000L else CLICK_DELAY_MS
-            submitPinOnce(delayMs = pinSubmitDelay, source = "flow-step-${step.order}")
+            // UNIFIED: same submit delay for every provider.
+            submitPinOnce(delayMs = SUBMIT_DELAY_MS, source = "flow-step-${step.order}")
+
             return true
         }
 
@@ -1751,36 +1798,46 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         var submitAttempt = 0
         lateinit var submitRunnable: Runnable
+        awaitingScheduledSubmit = true
         submitRunnable = Runnable {
-            val rt = rootInActiveWindow ?: return@Runnable
+            val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
             var rescheduled = false
             try {
                 // Never press Send while the dialog input is still empty — carriers
                 // answer "Input required. Try again" and the whole order dies.
                 if (!isValueCommittedInActiveField(rt, response)) {
                     submitAttempt++
-                    if (submitAttempt <= 3) {
+                    if (submitAttempt <= 2) {
                         Log.w(TAG, "⏳ Field not committed yet (attempt $submitAttempt) — retyping '$response' and waiting")
                         typeIntoActiveEditableField(rt, response)
-                        handler.postDelayed(submitRunnable, SUBMIT_RECHECK_DELAY_MS)
+                        handler.postDelayed(submitRunnable, RECHECK_DELAY_MS)
                         rescheduled = true
                         return@Runnable
                     }
-                    Log.e(TAG, "❌ Skipping Send — input field still empty after $submitAttempt attempts")
-                    return@Runnable
+                    // Same final fallback as the PIN path: if the field visibly holds
+                    // data (even unreadable/masked), press Send instead of giving up.
+                    val filledLen = activeFieldFilledLength(rt)
+                    if (filledLen <= 0) {
+                        Log.e(TAG, "❌ Skipping Send — input field still empty after $submitAttempt attempts")
+                        return@Runnable
+                    }
+                    Log.i(TAG, "✅ Sending after $submitAttempt attempts — field has data (len=$filledLen)")
                 }
                 submitCount++
                 Log.d(TAG, "📨 Non-PIN flow submit step=${step.order} submitCount=$submitCount")
                 clickSendOrOkButton(rt)
             } finally {
-                if (!rescheduled) { try { rt.recycle() } catch (_: Exception) {} } else { try { rt.recycle() } catch (_: Exception) {} }
+                if (!rescheduled) {
+                    awaitingScheduledSubmit = false
+                    scheduledSubmitRunnable = null
+                }
+                try { rt.recycle() } catch (_: Exception) {}
             }
         }
         scheduledSubmitRunnable = submitRunnable
-        // Give the EditText enough time to commit the typed value before pressing
-        // Send. Some carrier dialogs (Somtel/Hormuud) fire "Input required, Try again"
-        // if Send is dispatched too quickly after ACTION_SET_TEXT / PASTE.
-        handler.postDelayed(submitRunnable, NON_PIN_SUBMIT_DELAY_MS)
+        // Unified delay: give the EditText time to commit before pressing Send.
+        handler.postDelayed(submitRunnable, SUBMIT_DELAY_MS)
+
         return true
     }
 
@@ -2159,6 +2216,13 @@ class UssdAccessibilityService : AccessibilityService() {
     }
 
     private fun shouldSuppressAutoClickForDialog(root: AccessibilityNodeInfo, dialogText: String?): Boolean {
+        // A scheduled write -> verify -> send sequence owns this dialog. The generic
+        // auto-click loop must stay out of the way until it has run, otherwise Send
+        // can fire before the value is typed (the Somnet symptom).
+        if (awaitingScheduledSubmit) {
+            Log.i(TAG, "🛑 Suppressing auto-click — scheduled submit is pending")
+            return true
+        }
         if (shouldHardStopForPinStage(root, dialogText)) {
             return true
         }
