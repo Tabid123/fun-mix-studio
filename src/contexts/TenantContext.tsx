@@ -165,16 +165,30 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
     return () => sub.subscription.unsubscribe();
   }, [loadTenants, loadPublicTenant, clearTenantState]);
 
-  // A signed-in membership always wins over the anonymous storefront tenant,
-  // so a saved ?t=slug can never re-brand another tenant's dashboard.
-  const tenant = useMemo(
-    () =>
+  // An explicit `?t=slug` storefront link always wins: the visitor asked for
+  // that shop, even if they happen to be signed in to another tenant.
+  // Otherwise a signed-in membership wins, so a *saved* slug can never
+  // re-brand another tenant's dashboard.
+  const tenant = useMemo(() => {
+    let urlSlug: string | null = null;
+    try {
+      urlSlug = new URLSearchParams(window.location.search).get('t')?.trim() || null;
+    } catch { /* ignore */ }
+
+    if (urlSlug) {
+      const match =
+        tenants.find((t) => t.slug?.toLowerCase() === urlSlug!.toLowerCase()) ??
+        (publicTenant?.slug?.toLowerCase() === urlSlug.toLowerCase() ? publicTenant : null);
+      if (match) return match;
+    }
+
+    return (
       tenants.find((t) => t.id === currentTenantId) ??
       tenants[0] ??
       publicTenant ??
-      null,
-    [tenants, currentTenantId, publicTenant]
-  );
+      null
+    );
+  }, [tenants, currentTenantId, publicTenant]);
 
   // Persist selection
   useEffect(() => {
