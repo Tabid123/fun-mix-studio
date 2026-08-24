@@ -412,10 +412,18 @@ class UssdAccessibilityService : AccessibilityService() {
         }
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         awaitingScheduledSubmit = true
+        val pinSignature = dialogSignature(rootInActiveWindow)
+        submitDialogSignature = pinSignature
         lateinit var rRef: Runnable
         val r = Runnable {
             val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
             try {
+                // Stale-dialog guard: never write/send into a dialog that already changed.
+                val liveSignature = dialogSignature(rt)
+                if (pinSignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != pinSignature) {
+                    Log.w(TAG, "🚫 submitPinOnce[$source] dropped — dialog changed")
+                    return@Runnable
+                }
                 if (!pinFilledForSession || !pinVerifiedForSession || pinWriteFailedForSession) {
                     Log.w(TAG, "✋ submitPinOnce[$source] aborted at runtime — PIN verification lost")
                     return@Runnable
