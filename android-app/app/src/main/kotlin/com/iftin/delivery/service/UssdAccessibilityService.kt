@@ -494,6 +494,17 @@ class UssdAccessibilityService : AccessibilityService() {
         return isValueCommittedInActiveField(root, expected)
     }
 
+    /** Normalized dialog signature — used to bind a scheduled submit to ONE dialog. */
+    private fun dialogSignature(root: AccessibilityNodeInfo?): String {
+        if (root == null) return ""
+        val raw = try { extractDialogText(root) ?: "" } catch (_: Exception) { "" }
+        return raw.lowercase().replace(Regex("[^a-z]"), "").take(60)
+    }
+
+    /** Digits/decimal-only form so "0.01", "0,01", " 0.01 " all compare equal. */
+    private fun normalizeFieldValue(v: String): String =
+        v.replace(',', '.').filter { it.isDigit() || it == '.' }
+
     /** True when the active EditText really holds [expected] (or its masked form). */
     private fun isValueCommittedInActiveField(root: AccessibilityNodeInfo, expected: String): Boolean {
         if (expected.isBlank()) return false
@@ -504,6 +515,10 @@ class UssdAccessibilityService : AccessibilityService() {
             val actual = best.node.text?.toString()?.trim().orEmpty()
             val maskedValue = actual.length == expected.length && actual.all { it == '•' || it == '*' }
             if (actual == expected || maskedValue) return true
+            // Carriers may re-render the value with a different separator/padding.
+            val na = normalizeFieldValue(actual)
+            val ne = normalizeFieldValue(expected)
+            if (ne.isNotEmpty() && na == ne) return true
             // Password fields on some carrier dialogs (Somtel/Amtel) expose an EMPTY
             // text while the bullets live on a sibling/label node. Accept that case
             // when the masked length in this dialog matches what we typed — this is
