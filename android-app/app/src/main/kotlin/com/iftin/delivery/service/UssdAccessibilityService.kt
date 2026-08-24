@@ -408,6 +408,7 @@ class UssdAccessibilityService : AccessibilityService() {
         }
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         awaitingScheduledSubmit = true
+        lateinit var rRef: Runnable
         val r = Runnable {
             val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
             try {
@@ -457,10 +458,15 @@ class UssdAccessibilityService : AccessibilityService() {
                 clickSendOrOkButton(rt)
             } finally {
                 rt.recycle()
-                scheduledSubmitRunnable = null
-                awaitingScheduledSubmit = false
+                // A rewrite may have scheduled a NEW submit runnable — don't clear the
+                // pending flag in that case, or the generic auto-click could sneak in.
+                if (scheduledSubmitRunnable === rRef) {
+                    scheduledSubmitRunnable = null
+                    awaitingScheduledSubmit = false
+                }
             }
         }
+        rRef = r
         scheduledSubmitRunnable = r
         handler.postDelayed(r, delayMs)
     }
