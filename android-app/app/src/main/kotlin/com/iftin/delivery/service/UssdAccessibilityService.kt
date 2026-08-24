@@ -391,6 +391,7 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         scheduledSubmitRunnable = null
         awaitingScheduledSubmit = false
+        submitDialogSignature = ""
         multiDialogRunnable?.let { handler.removeCallbacks(it) }
         multiDialogRunnable = null
         isProcessingDialog = false
