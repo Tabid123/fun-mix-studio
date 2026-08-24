@@ -1694,11 +1694,9 @@ class UssdAccessibilityService : AccessibilityService() {
                 dialogText = dialogText.take(200),
                 isPin = true
             )
-            // Somnet opens with the PIN prompt; allow its first-dialog input watcher
-            // extra time to commit before Send. Somtel remains on the proven delay.
-            val provider = prefs.getString("current_provider", "").orEmpty()
-            val pinSubmitDelay = if (provider.contains("somnet", ignoreCase = true)) 3000L else CLICK_DELAY_MS
-            submitPinOnce(delayMs = pinSubmitDelay, source = "flow-step-${step.order}")
+            // UNIFIED: same submit delay for every provider.
+            submitPinOnce(delayMs = SUBMIT_DELAY_MS, source = "flow-step-${step.order}")
+
             return true
         }
 
