@@ -1383,6 +1383,15 @@ class UssdAccessibilityService : AccessibilityService() {
             return
         }
         if (dialogFingerprint.isNotBlank()) {
+            // A genuinely NEW dialog page invalidates any pending submit from the
+            // previous page — otherwise its retype writes the old value here.
+            if (lastDialogFingerprint.isNotBlank() && dialogFingerprint != lastDialogFingerprint && scheduledSubmitRunnable != null) {
+                scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+                scheduledSubmitRunnable = null
+                awaitingScheduledSubmit = false
+                submitDialogSignature = ""
+                Log.d(TAG, "🧹 New dialog page — dropped pending submit from previous page")
+            }
             lastDialogFingerprint = dialogFingerprint
         }
 
