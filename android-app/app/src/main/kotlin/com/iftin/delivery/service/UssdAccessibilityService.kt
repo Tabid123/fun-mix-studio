@@ -80,6 +80,14 @@ class UssdAccessibilityService : AccessibilityService() {
         val maskedTreeLength: Int = 0
     )
 
+    private enum class FlowResponseKind {
+        PIN,
+        AMOUNT,
+        RECEIVER,
+        MENU_CHOICE,
+        UNKNOWN
+    }
+
     companion object {
         private const val TAG = "UssdAccessibility"
         const val ACTION_USSD_CLICK_COMPLETE = "com.iftin.delivery.USSD_CLICK_COMPLETE"
@@ -495,6 +503,11 @@ class UssdAccessibilityService : AccessibilityService() {
 
     /** Reads the current text of the best editable (PIN) field on screen. */
     private fun readActivePinFieldText(root: AccessibilityNodeInfo): String {
+        return readActiveEditableFieldText(root)
+    }
+
+    /** Reads the current text of the best editable field on screen. */
+    private fun readActiveEditableFieldText(root: AccessibilityNodeInfo): String {
         val candidates = collectEditableFieldCandidates(root)
         try {
             val best = selectBestEditableCandidate(candidates) ?: return ""
@@ -551,6 +564,47 @@ class UssdAccessibilityService : AccessibilityService() {
             false
         } finally {
             candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
+        }
+    }
+
+    private fun parseDecimalValue(value: String): Double? {
+        val cleaned = value.trim()
+            .replace(',', '.')
+            .filter { it.isDigit() || it == '.' }
+        if (cleaned.isBlank() || cleaned.count { it == '.' } > 1) return null
+        return cleaned.toDoubleOrNull()
+    }
+
+    private fun isAmountCommittedInActiveField(root: AccessibilityNodeInfo, expected: String): Boolean {
+        if (isValueCommittedInActiveField(root, expected)) return true
+        val actual = readActiveEditableFieldText(root)
+        val actualNumber = parseDecimalValue(actual) ?: return false
+        val expectedNumber = parseDecimalValue(expected) ?: return false
+        return kotlin.math.abs(actualNumber - expectedNumber) < 0.000001
+    }
+
+    private fun isStepValueCommitted(root: AccessibilityNodeInfo, expected: String, kind: FlowResponseKind): Boolean {
+        return if (kind == FlowResponseKind.AMOUNT) {
+            isAmountCommittedInActiveField(root, expected)
+        } else {
+            isValueCommittedInActiveField(root, expected)
+        }
+    }
+
+    private fun canTrustFilledButUnverifiedStep(root: AccessibilityNodeInfo, expected: String, kind: FlowResponseKind): Boolean {
+        val filledLen = activeFieldFilledLength(root)
+        if (filledLen <= 0) return false
+        return when (kind) {
+            FlowResponseKind.AMOUNT -> {
+                // Never send a decimal amount if the field appears to have dropped the
+                // decimal separator (e.g. expected 0.01 but visible field is 001).
+                val visible = readActiveEditableFieldText(root)
+                visible.isBlank() && filledLen == expected.length
+            }
+            FlowResponseKind.RECEIVER -> filledLen == expected.length
+            FlowResponseKind.MENU_CHOICE,
+            FlowResponseKind.UNKNOWN -> true
+            FlowResponseKind.PIN -> false
         }
     }
 
@@ -1185,14 +1239,82 @@ class UssdAccessibilityService : AccessibilityService() {
 
         return lower.contains("pin") ||
             lower.contains("password") ||
-            lower.contains("furaha")
+            lower.contains("furaha") ||
+            lower.contains("sirta")
     }
 
     private fun looksLikeNumberedMenu(text: String): Boolean {
         if (text.isBlank()) return false
-        // Count occurrences of "1." / "2)" etc. — 2+ means it's a menu list.
-        val matches = Regex("(?m)(?:^|\\s)[1-9][.)]\\s+\\S").findAll(text).count()
+        // Count occurrences of "1.", "2)", "1 -", or carrier variants like
+        // "1 Haa". 2+ means it is a menu/choice list, not a value prompt.
+        val matches = Regex("(?m)(?:^|\\s)[1-9]\\s*[.)-]?\\s+\\S").findAll(text).count()
         return matches >= 2
+    }
+
+    private fun flowResponseKind(step: UssdFlowsClient.FlowStep): FlowResponseKind {
+        val template = step.responseTemplate.lowercase().trim()
+        val literal = template.trim('{', '}')
+        return when {
+            step.isPinField || template.contains("{pin}") || template.contains("{sim_password}") -> FlowResponseKind.PIN
+            template.contains("{amount}") || template.contains("{cost_price}") || template.contains("{topup_amount}") -> FlowResponseKind.AMOUNT
+            template.contains("{receiver}") || template.contains("{receiver_phone}") || template.contains("{phone}") || template.contains("{number}") -> FlowResponseKind.RECEIVER
+            literal.isNotEmpty() && literal.length <= 2 && literal.all(Char::isDigit) -> FlowResponseKind.MENU_CHOICE
+            else -> FlowResponseKind.UNKNOWN
+        }
+    }
+
+    private fun dialogLooksLikePinPrompt(text: String?): Boolean {
+        val lower = text.orEmpty().lowercase()
+        return lower.isNotBlank() && !looksLikeNumberedMenu(lower) &&
+            (lower.contains("pin") || lower.contains("password") || lower.contains("furaha") || lower.contains("sirta"))
+    }
+
+    private fun dialogLooksLikeAmountPrompt(text: String?): Boolean {
+        val lower = text.orEmpty().lowercase()
+        if (lower.isBlank() || looksLikeNumberedMenu(lower)) return false
+        if (dialogLooksLikePinPrompt(lower)) return false
+        return listOf(
+            "geli lacag", "lacagta", "qiimaha", "qiimo", "amount", "enter amount",
+            "dollar", "usd", "wadarta", "total", "mount"
+        ).any { lower.contains(it) }
+    }
+
+    private fun dialogLooksLikeReceiverPrompt(text: String?): Boolean {
+        val lower = text.orEmpty().lowercase()
+        if (lower.isBlank() || looksLikeNumberedMenu(lower)) return false
+        // "lambarka sirta" means secret/PIN number, not receiver phone.
+        if (dialogLooksLikePinPrompt(lower)) return false
+        return listOf(
+            "geli mobil", "geli mobile", "mobilka", "mobile", "lambarka", "lambar",
+            "number", "phone", "taleefan", "telefoon", "receiver", "reciver",
+            "hubi mobil", "confirm number", "xaqiiji lambarka"
+        ).any { lower.contains(it) }
+    }
+
+    private fun dialogLooksLikeMenuChoicePrompt(text: String?): Boolean {
+        val lower = text.orEmpty().lowercase()
+        if (lower.isBlank()) return false
+        if (looksLikeNumberedMenu(lower)) return true
+        if (dialogLooksLikeAmountPrompt(lower) || dialogLooksLikeReceiverPrompt(lower) || dialogLooksLikePinPrompt(lower)) return false
+        return listOf(
+            "ma hubtaa", "mu hubtaa", "haa", "maya", "press 1", "riix 1",
+            "accept", "ogolow", "door", "xulo", "select", "continue", "sii wad",
+            "dirid lacag", "lacag dirid", "send money"
+        ).any { lower.contains(it) }
+    }
+
+    private fun isFlowStepCompatibleWithDialog(step: UssdFlowsClient.FlowStep, dialogText: String): Boolean {
+        val amountPrompt = dialogLooksLikeAmountPrompt(dialogText)
+        val receiverPrompt = dialogLooksLikeReceiverPrompt(dialogText)
+        val pinPrompt = dialogLooksLikePinPrompt(dialogText)
+        val menuPrompt = dialogLooksLikeMenuChoicePrompt(dialogText)
+        return when (flowResponseKind(step)) {
+            FlowResponseKind.PIN -> pinPrompt
+            FlowResponseKind.AMOUNT -> amountPrompt
+            FlowResponseKind.RECEIVER -> receiverPrompt
+            FlowResponseKind.MENU_CHOICE -> menuPrompt || (!amountPrompt && !receiverPrompt && !pinPrompt)
+            FlowResponseKind.UNKNOWN -> true
+        }
     }
 
     private fun matchesPendingPinFlowStep(dialogText: String?): Boolean {
@@ -1652,21 +1774,30 @@ class UssdAccessibilityService : AccessibilityService() {
             pinWriteFailedForSession = false
             pinSetCount = 0
         }
-        val looksLikePinDialog = !isMenuList && (
-            lower.contains("pin") ||
-                lower.contains("password") ||
-                lower.contains("furaha")
-        )
-        val matchedStep = flow.steps.firstOrNull { s ->
+        val looksLikePinDialog = dialogLooksLikePinPrompt(dialogText)
+        val unansweredSteps = flow.steps.filter { it.order !in completedFlowSteps }
+        val expectedNextOrder = (completedFlowSteps.maxOrNull() ?: 0) + 1
+        val keywordMatches = unansweredSteps.filter { s ->
             s.order !in completedFlowSteps &&
             s.keywords.isNotEmpty() &&
             s.keywords.any { kw -> lower.contains(kw.lowercase()) }
         }
-        val step = matchedStep ?: flow.steps.firstOrNull { s ->
-            s.order !in completedFlowSteps &&
+        val compatibleKeywordMatches = keywordMatches.filter { s -> isFlowStepCompatibleWithDialog(s, dialogText) }
+        if (keywordMatches.isNotEmpty() && compatibleKeywordMatches.isEmpty()) {
+            Log.w(
+                TAG,
+                "🛡️ Flow ${flow.triggerCode}: keyword match rejected by value-type guard. " +
+                    "matches=${keywordMatches.map { it.order }} dialog=${dialogText.take(120)}"
+            )
+        }
+        val matchedStep = compatibleKeywordMatches.firstOrNull { it.order == expectedNextOrder }
+            ?: compatibleKeywordMatches.minByOrNull { it.order }
+        val expectedStep = flow.steps.firstOrNull { it.order == expectedNextOrder }
+        val step = matchedStep ?: expectedStep?.takeIf { s ->
                 !s.isPinField &&
                 completedFlowSteps.isNotEmpty() &&
                 !looksLikePinDialog &&
+                isFlowStepCompatibleWithDialog(s, dialogText) &&
                 // A confirmation menu ("1. Haa / 2. Maya") sometimes exposes no
                 // EditText to Accessibility; still allow the numeric answer there.
                 (hasVisibleEditableInput(root) || isMenuList) &&
@@ -1690,6 +1821,11 @@ class UssdAccessibilityService : AccessibilityService() {
                 val nextOrder = (completedFlowSteps.maxOrNull() ?: 0) + 1
                 UssdFlowsClient.logUnmatchedAsync(flow.id, nextOrder, dialogText, deviceId)
             } catch (_: Exception) {}
+            return false
+        }
+
+        if (!isFlowStepCompatibleWithDialog(step, dialogText)) {
+            Log.w(TAG, "🛡️ Flow step #${step.order} blocked — response kind ${flowResponseKind(step)} does not match this dialog: ${dialogText.take(120)}")
             return false
         }
 
@@ -1801,6 +1937,7 @@ class UssdAccessibilityService : AccessibilityService() {
             Log.w(TAG, "⚠️ Failed to type flow response into EditText")
             return false
         }
+        val responseKind = flowResponseKind(step)
 
         // Keep a short marker for potential SET_TEXT echo events only.
         // onAccessibilityEvent no longer suppresses TYPE_WINDOW_STATE_CHANGED using this,
@@ -1838,7 +1975,7 @@ class UssdAccessibilityService : AccessibilityService() {
                 }
                 // Never press Send while the dialog input is still empty — carriers
                 // answer "Input required. Try again" and the whole order dies.
-                val verified = isValueCommittedInActiveField(rt, response)
+                val verified = isStepValueCommitted(rt, response, responseKind)
                 Log.i(TAG, "USSD[step=${step.order}] VERIFY ${if (verified) "ok" else "retry"} value='$response'")
                 if (!verified) {
                     submitAttempt++
@@ -1856,6 +1993,13 @@ class UssdAccessibilityService : AccessibilityService() {
                     if (filledLen <= 0) {
                         Log.w(TAG, "⚠️ Field reads empty after $submitAttempt attempts — final write then Send anyway")
                         typeIntoActiveEditableField(rt, response)
+                        if (!isStepValueCommitted(rt, response, responseKind) && !canTrustFilledButUnverifiedStep(rt, response, responseKind)) {
+                            Log.e(TAG, "🛑 USSD[step=${step.order}] SEND blocked — final write did not commit safe ${responseKind.name} value '$response'")
+                            return@Runnable
+                        }
+                    } else if (!canTrustFilledButUnverifiedStep(rt, response, responseKind)) {
+                        Log.e(TAG, "🛑 USSD[step=${step.order}] SEND blocked — unverified ${responseKind.name} value would be unsafe (expected='$response' len=$filledLen)")
+                        return@Runnable
                     } else {
                         Log.i(TAG, "✅ Sending after $submitAttempt attempts — field has data (len=$filledLen)")
                     }
@@ -1907,8 +2051,104 @@ class UssdAccessibilityService : AccessibilityService() {
                     node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
                 } catch (_: Exception) { false }
             }
+            try { SystemClock.sleep(120L) } catch (_: Exception) {}
+            try { node.refresh() } catch (_: Exception) {}
+            val afterPaste = node.text?.toString().orEmpty()
+            if ((!ok || !isVisibleTextEquivalentToExpected(afterPaste, value)) && value.any { it.isDigit() || it == '.' || it == ',' }) {
+                ok = writeWithVisibleImeText(root, value) || ok
+            }
             setTextSuppressUntilMs = System.currentTimeMillis() + 1500L
             ok
+        } finally {
+            candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
+        }
+    }
+
+    private fun isVisibleTextEquivalentToExpected(actual: String, expected: String): Boolean {
+        if (actual == expected) return true
+        val normalizedActual = normalizeFieldValue(actual)
+        val normalizedExpected = normalizeFieldValue(expected)
+        return normalizedExpected.isNotEmpty() && normalizedActual == normalizedExpected
+    }
+
+    private fun keyCharFromLabel(value: String?): Char? {
+        val trimmed = value?.trim().orEmpty()
+        if (trimmed.isBlank()) return null
+        trimmed.firstOrNull { it.isDigit() }?.let { return it }
+        return when {
+            trimmed == "." || trimmed.equals("dot", ignoreCase = true) || trimmed.equals("period", ignoreCase = true) -> '.'
+            trimmed == "," || trimmed.equals("comma", ignoreCase = true) -> '.'
+            else -> null
+        }
+    }
+
+    private fun dispatchGestureText(root: AccessibilityNodeInfo, value: String): Boolean {
+        val needed = value.mapNotNull { ch -> if (ch.isDigit() || ch == '.' || ch == ',') if (ch == ',') '.' else ch else null }.distinct()
+        if (needed.isEmpty()) return false
+        val keyNodes = mutableMapOf<Char, Rect>()
+        fun walk(node: AccessibilityNodeInfo?) {
+            if (node == null) return
+            try {
+                val key = keyCharFromLabel(node.text?.toString()) ?: keyCharFromLabel(node.contentDescription?.toString())
+                if (key != null && key in needed && node.isVisibleToUser) {
+                    val b = resolveGestureTapBounds(node)
+                    if (b.width() > 24 && b.height() > 24) {
+                        val prev = keyNodes[key]
+                        if (prev == null || (b.width() * b.height()) > (prev.width() * prev.height())) {
+                            keyNodes[key] = b
+                        }
+                    }
+                }
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { child ->
+                        try { walk(child) } finally { child.recycle() }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        walk(root)
+        val missing = needed.filter { keyNodes[it] == null }
+        if (missing.isNotEmpty()) {
+            Log.w(TAG, "🎹 visible IME text fallback missing keys=$missing found=${keyNodes.keys}")
+            return false
+        }
+        val builder = GestureDescription.Builder()
+        val interKeyDelayMs = 170L
+        val strokeDurationMs = 65L
+        value.mapNotNull { ch -> if (ch.isDigit() || ch == '.' || ch == ',') if (ch == ',') '.' else ch else null }
+            .forEachIndexed { index, ch ->
+                val b = keyNodes[ch] ?: return false
+                val path = Path().apply { moveTo(b.exactCenterX(), b.exactCenterY()) }
+                builder.addStroke(GestureDescription.StrokeDescription(path, index * interKeyDelayMs, strokeDurationMs))
+            }
+        val dispatched = dispatchGesture(builder.build(), null, null)
+        if (dispatched) {
+            val settleDelay = (value.length * interKeyDelayMs) + strokeDurationMs + 220L
+            SystemClock.sleep(settleDelay)
+        }
+        Log.d(TAG, "🎹 visible IME text fallback dispatched=$dispatched len=${value.length}")
+        return dispatched
+    }
+
+    private fun writeWithVisibleImeText(root: AccessibilityNodeInfo, value: String): Boolean {
+        val candidates = collectEditableFieldCandidates(root)
+        return try {
+            val best = selectBestEditableCandidate(candidates) ?: return false
+            clearEditableField(best.node)
+            focusEditableField(best.node, requireAccessibilityFocus = true)
+            try { SystemClock.sleep(350L) } catch (_: Exception) {}
+            val imeRoots = windows
+                .filter { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+                .mapNotNull { window -> try { window.root } catch (_: Exception) { null } }
+            if (imeRoots.isEmpty()) {
+                Log.w(TAG, "🎹 visible IME text fallback unavailable — keyboard not visible")
+                return false
+            }
+            try {
+                imeRoots.any { imeRoot -> dispatchGestureText(imeRoot, value) }
+            } finally {
+                imeRoots.forEach { try { it.recycle() } catch (_: Exception) {} }
+            }
         } finally {
             candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
         }
@@ -1918,11 +2158,14 @@ class UssdAccessibilityService : AccessibilityService() {
      *  "20" -> "20", "11.60" -> "11.60", "0.12" -> "0.12" */
     private fun formatAmountForUssd(raw: String): String {
         if (raw.isBlank()) return ""
-        val n = raw.toDoubleOrNull() ?: return raw
+        val cleaned = raw.trim()
+            .replace(',', '.')
+            .filter { it.isDigit() || it == '.' }
+        val n = cleaned.toDoubleOrNull() ?: return cleaned.ifBlank { raw.trim() }
         if (n == n.toLong().toDouble()) return n.toLong().toString()
         // EditText prompts expect a normal decimal number — NOT the asterisk
         // USSD-code form. e.g. "0.12" stays "0.12" so Somtel reads $0.12 (not $12).
-        return String.format("%.2f", n)
+        return String.format(java.util.Locale.US, "%.2f", n)
     }
     
     /**
