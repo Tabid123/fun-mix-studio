@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { clearOfflineCache } from '@/lib/tenantSession';
+import { useSearchParams } from '@/lib/router-compat';
 
 export interface Tenant {
   id: string;
