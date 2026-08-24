@@ -9,7 +9,7 @@ import {
   CheckCircle2,
   Check,
 } from 'lucide-react';
-import { useBrand } from '@/hooks/useBrand';
+import iftinLogo from '@/assets/iftin-logo.png';
 import ContactDialog from '@/components/landing/ContactDialog';
 import heroDashboard from '@/assets/landing/hero-dashboard.jpg';
 import missionYouth from '@/assets/landing/mission-youth.jpg';
@@ -35,7 +35,6 @@ const NAV = [
 
 const Landing = () => {
   const navigate = useNavigate();
-  const { logoUrl } = useBrand();
   const brandName = 'Iftin Resellers';
 
   useEffect(() => {
@@ -48,7 +47,7 @@ const Landing = () => {
       <header className="sticky top-0 z-40 border-b border-[#dbe1ff] bg-[#f8f9ff]/90 backdrop-blur">
         <div className="mx-auto flex max-w-[1280px] items-center justify-between px-5 py-4 md:px-20">
           <div className="flex items-center gap-2.5">
-            {logoUrl && <img src={logoUrl} alt={`${brandName} logo`} className="h-8 w-8 rounded-lg object-cover" />}
+            <img src={iftinLogo} alt={`${brandName} logo`} className="h-8 w-8 rounded-lg object-cover" />
             <span className="text-[17px] font-extrabold tracking-tight" style={{ color: BRAND }}>
               {brandName}
             </span>
