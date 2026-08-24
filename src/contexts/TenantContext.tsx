@@ -177,16 +177,13 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
   // Otherwise a signed-in membership wins, so a *saved* slug can never
   // re-brand another tenant's dashboard.
   const tenant = useMemo(() => {
-    let urlSlug: string | null = null;
-    try {
-      urlSlug = new URLSearchParams(window.location.search).get('t')?.trim() || null;
-    } catch { /* ignore */ }
-
     if (urlSlug) {
-      const match =
-        tenants.find((t) => t.slug?.toLowerCase() === urlSlug!.toLowerCase()) ??
-        (publicTenant?.slug?.toLowerCase() === urlSlug.toLowerCase() ? publicTenant : null);
-      if (match) return match;
+      // Strict: only the tenant named in the link may render. If it can't be
+      // resolved we show nothing rather than another tenant's shop.
+      return (
+        tenants.find((t) => t.slug?.toLowerCase() === urlSlug) ??
+        (publicTenant?.slug?.toLowerCase() === urlSlug ? publicTenant : null)
+      );
     }
 
     return (
@@ -195,7 +192,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
       publicTenant ??
       null
     );
-  }, [tenants, currentTenantId, publicTenant]);
+  }, [tenants, currentTenantId, publicTenant, urlSlug]);
 
   // Persist selection
   useEffect(() => {
