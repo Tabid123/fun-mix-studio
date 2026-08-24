@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { clearOfflineCache } from '@/lib/tenantSession';
+import { useSearchParams } from '@/lib/router-compat';
 
 export interface Tenant {
   id: string;
@@ -31,15 +32,10 @@ interface TenantContextValue {
 const STORAGE_KEY = 'active_tenant_id';
 const PUBLIC_SLUG_KEY = 'public_tenant_slug';
 
-// Resolve the storefront tenant slug for anonymous visitors:
-// ?t=slug  →  saved slug  →  subdomain (slug.example.com)
-const resolvePublicSlug = (): string | null => {
+// Fallback storefront slug when the URL carries no `?t=`:
+// saved slug → subdomain (slug.example.com)
+const fallbackPublicSlug = (): string | null => {
   try {
-    const fromUrl = new URLSearchParams(window.location.search).get('t');
-    if (fromUrl) {
-      localStorage.setItem(PUBLIC_SLUG_KEY, fromUrl);
-      return fromUrl;
-    }
     const saved = localStorage.getItem(PUBLIC_SLUG_KEY);
     if (saved) return saved;
     const host = window.location.hostname;
@@ -75,14 +71,26 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
   const [logoUrl, setLogoUrl] = useState<string | null>(null);
   const [publicTenant, setPublicTenant] = useState<TenantMembership | null>(null);
 
+  // The storefront slug from the current URL (`?t=slug`) — reactive, so
+  // navigating between two reseller links never keeps the old tenant.
+  const [searchParams] = useSearchParams();
+  const urlSlug = (searchParams.get('t') ?? '').trim().toLowerCase() || null;
+
+  useEffect(() => {
+    if (!urlSlug) return;
+    try { localStorage.setItem(PUBLIC_SLUG_KEY, urlSlug); } catch { /* ignore */ }
+  }, [urlSlug]);
+
   // Anonymous storefront branding (logo + primary color) via public RPC
   const loadPublicTenant = useCallback(async () => {
-    const slug = resolvePublicSlug();
+    const slug = urlSlug ?? fallbackPublicSlug();
     if (!slug) { setPublicTenant(null); setPublicLoading(false); return; }
+    setPublicTenant(null);
     const { data, error } = await supabase.rpc('get_tenant_by_slug', { _slug: slug });
     // A logout/clear may have wiped the saved slug while this request was in
     // flight — never re-apply the old tenant's branding in that case.
-    if (resolvePublicSlug() !== slug) { setPublicTenant(null); setPublicLoading(false); return; }
+    const stillCurrent = urlSlug ? urlSlug === slug : fallbackPublicSlug() === slug;
+    if (!stillCurrent) { setPublicTenant(null); setPublicLoading(false); return; }
     if (error || !data || !(data as any[]).length) {
       setPublicTenant(null);
       setPublicLoading(false);
@@ -100,7 +108,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
       role: 'visitor',
     });
     setPublicLoading(false);
-  }, []);
+  }, [urlSlug]);
 
 
   const clearTenantState = useCallback(() => {
@@ -170,16 +178,13 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
   // Otherwise a signed-in membership wins, so a *saved* slug can never
   // re-brand another tenant's dashboard.
   const tenant = useMemo(() => {
-    let urlSlug: string | null = null;
-    try {
-      urlSlug = new URLSearchParams(window.location.search).get('t')?.trim() || null;
-    } catch { /* ignore */ }
-
     if (urlSlug) {
-      const match =
-        tenants.find((t) => t.slug?.toLowerCase() === urlSlug!.toLowerCase()) ??
-        (publicTenant?.slug?.toLowerCase() === urlSlug.toLowerCase() ? publicTenant : null);
-      if (match) return match;
+      // Strict: only the tenant named in the link may render. If it can't be
+      // resolved we show nothing rather than another tenant's shop.
+      return (
+        tenants.find((t) => t.slug?.toLowerCase() === urlSlug) ??
+        (publicTenant?.slug?.toLowerCase() === urlSlug ? publicTenant : null)
+      );
     }
 
     return (
@@ -188,7 +193,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
       publicTenant ??
       null
     );
-  }, [tenants, currentTenantId, publicTenant]);
+  }, [tenants, currentTenantId, publicTenant, urlSlug]);
 
   // Persist selection
   useEffect(() => {
