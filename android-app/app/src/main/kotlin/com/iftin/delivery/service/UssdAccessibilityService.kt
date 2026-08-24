@@ -234,6 +234,10 @@ class UssdAccessibilityService : AccessibilityService() {
     // True while a scheduled write→verify→send sequence is pending. While set, the
     // generic auto-click loop must never press Send (prevented Somnet early clicks).
     @Volatile private var awaitingScheduledSubmit = false
+    // Signature (normalized dialog text) of the dialog a scheduled submit belongs to.
+    // A pending runnable must NEVER retype its old value into a NEW dialog — that is
+    // what made Somnet type the previous step's value ("5516") into "Geli lacagta".
+    @Volatile private var submitDialogSignature = ""
 
     // Delayed generic confirm runnable from onAccessibilityEvent.
     // Must be cancellable when a PIN dialog appears.
