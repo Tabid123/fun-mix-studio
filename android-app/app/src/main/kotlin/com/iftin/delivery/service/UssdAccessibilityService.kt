@@ -198,7 +198,7 @@ class UssdAccessibilityService : AccessibilityService() {
             "dialpad", "digits", "keypad", "dialButton", "one", "two", "three",
             "zero", "deleteButton", "searchview"
         )
-        private const val MAX_PIN_REWRITE_ATTEMPTS = 2
+        private const val MAX_PIN_REWRITE_ATTEMPTS = 4
         private const val MULTI_DIALOG_TIMEOUT_MS = 10000L
     }
     
@@ -402,7 +402,7 @@ class UssdAccessibilityService : AccessibilityService() {
      * Schedule a single Send/OK click for the current PIN entry.
      * Idempotent: only one submit per session, cancels any prior scheduled runnable.
      */
-    private fun submitPinOnce(delayMs: Long = 300L, source: String) {
+    private fun submitPinOnce(delayMs: Long = 300L, source: String, onSubmitted: (() -> Unit)? = null) {
         if (pinSubmittedForSession) {
             Log.d(TAG, "🛑 submitPinOnce[$source] ignored — already submitted (submitCount=$submitCount)")
             return
@@ -453,10 +453,14 @@ class UssdAccessibilityService : AccessibilityService() {
                         // (masked bullets or any text), press Send instead of giving up.
                         val filledLen = activeFieldFilledLength(rt)
                         if (filledLen > 0) {
-                            pinSubmittedForSession = true
-                            submitCount++
-                            Log.i(TAG, "✅ submitPinOnce[$source] sending after $pinRewriteAttempts rewrites — field has data (len=$filledLen, unreadable but non-empty)")
-                            clickSendOrOkButton(rt)
+                            Log.i(TAG, "USSD[$source] SEND fallback — field has data after $pinRewriteAttempts rewrites (len=$filledLen)")
+                            if (clickSendOrOkButton(rt, allowScheduledSubmit = true, source = source)) {
+                                pinSubmittedForSession = true
+                                submitCount++
+                                onSubmitted?.invoke()
+                            } else {
+                                Log.w(TAG, "USSD[$source] SEND failed — no Send/OK button clicked")
+                            }
                         } else {
                             pinWriteFailedForSession = true
                             Log.e(TAG, "❌ submitPinOnce[$source] blocked after $pinRewriteAttempts rewrites — field is truly empty; Send will NOT be clicked")
@@ -465,10 +469,15 @@ class UssdAccessibilityService : AccessibilityService() {
                     return@Runnable
                 }
 
-                pinSubmittedForSession = true
-                submitCount++
-                Log.i(TAG, "✅ submitPinOnce[$source] auto-sending verified PIN (submitCount=$submitCount)")
-                clickSendOrOkButton(rt)
+                Log.i(TAG, "USSD[$source] SEND verified PIN")
+                if (clickSendOrOkButton(rt, allowScheduledSubmit = true, source = source)) {
+                    pinSubmittedForSession = true
+                    submitCount++
+                    onSubmitted?.invoke()
+                    Log.i(TAG, "✅ submitPinOnce[$source] auto-sent verified PIN (submitCount=$submitCount)")
+                } else {
+                    Log.w(TAG, "USSD[$source] SEND failed — no Send/OK button clicked")
+                }
             } finally {
                 rt.recycle()
                 // A rewrite may have scheduled a NEW submit runnable — don't clear the
@@ -1613,6 +1622,14 @@ class UssdAccessibilityService : AccessibilityService() {
             return false
         }
 
+        if (awaitingScheduledSubmit && submitDialogSignature.isNotBlank()) {
+            val currentSignature = dialogSignature(root)
+            if (currentSignature.isNotBlank() && currentSignature == submitDialogSignature) {
+                Log.i(TAG, "USSD[pending] WRITE skipped — this dialog already has a scheduled submit")
+                return true
+            }
+        }
+
         val lower = dialogText.lowercase()
         // Numbered menu lists (e.g. "1. Reseller  2. Transfer  5. Change Password")
         // contain the word "password"/"pin" as option labels — they are NOT PIN prompts.
@@ -1684,9 +1701,13 @@ class UssdAccessibilityService : AccessibilityService() {
         // PIN guard: do NOT re-enter PIN if already filled this session.
         // Prevents Somnet "Invalid PIN format" loops where the carrier re-prompts.
         if (step.isPinField && pinFilledForSession) {
-            Log.d(TAG, "⏭️ Flow PIN step #${step.order} already filled this session; skipping")
-            completedFlowSteps.add(step.order)
-            return false
+            if (pinSubmittedForSession) {
+                completedFlowSteps.add(step.order)
+                Log.d(TAG, "⏭️ Flow PIN step #${step.order} already submitted this session; marking complete")
+            } else {
+                Log.d(TAG, "⏭️ Flow PIN step #${step.order} already filled and awaiting scheduled submit")
+            }
+            return true
         }
 
         // Substitute placeholders with current order context
@@ -1735,7 +1756,6 @@ class UssdAccessibilityService : AccessibilityService() {
                 Log.w(TAG, "⚠️ Flow PIN step #${step.order} write skipped/failed")
                 return false
             }
-            completedFlowSteps.add(step.order)
             reportFlowProgress(
                 stepOrder = step.order,
                 totalSteps = flow.steps.size,
@@ -1745,70 +1765,39 @@ class UssdAccessibilityService : AccessibilityService() {
                 isPin = true
             )
             // UNIFIED: same submit delay for every provider.
-            submitPinOnce(delayMs = SUBMIT_DELAY_MS, source = "flow-step-${step.order}")
+            submitPinOnce(
+                delayMs = SUBMIT_DELAY_MS,
+                source = "flow-step-${step.order}",
+                onSubmitted = { completedFlowSteps.add(step.order) }
+            )
 
             return true
         }
 
-        // ===== Non-PIN flow step: clear + write once, then submit =====
-        val edits = mutableListOf<AccessibilityNodeInfo>()
-        findEditTexts(root, edits)
-        if (edits.isEmpty()) {
+        // ===== Non-PIN flow step: same clear -> write -> verify -> send path as PIN =====
+        if (!hasVisibleEditableInput(root)) {
             // Confirmation menus ("1. Haa / 2. Maya") can hide their input field.
             // Try clicking the matching menu option directly instead of pressing
             // Send with nothing selected.
             val shortNumeric = response.length <= 2 && response.all(Char::isDigit)
             if (shortNumeric && clickNumberedMenuOption(root, response)) {
                 completedFlowSteps.add(step.order)
-                Log.i(TAG, "✅ Selected menu option '$response' by click (no EditText available)")
+                reportFlowProgress(
+                    stepOrder = step.order,
+                    totalSteps = flow.steps.size,
+                    keywords = step.keywords,
+                    response = response,
+                    dialogText = dialogText.take(200),
+                    isPin = false
+                )
+                Log.i(TAG, "USSD[step=${step.order}] SEND clicked numbered menu option '$response' (no EditText available)")
                 return true
             }
             Log.w(TAG, "⚠️ Flow step matched but no EditText to type into")
             return false
         }
 
-        var typed = false
-        try {
-            for (et in edits) {
-                et.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                // Clear existing text first to prevent appending
-                val clearArgs = android.os.Bundle().apply {
-                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
-                }
-                et.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clearArgs)
-                val args = android.os.Bundle().apply {
-                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, response)
-                }
-                if (et.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
-                    typed = true
-                    // Verify the dot wasn't stripped by a numeric input filter
-                    // (some carrier dialers use inputType=number which removes '.').
-                    // If stripped, fall back to clipboard PASTE which bypasses filters.
-                    if (response.contains('.')) {
-                        val current = et.text?.toString() ?: ""
-                        if (!current.contains('.')) {
-                            Log.w(TAG, "⚠️ Dot stripped from '$response' (got '$current') — retrying via clipboard PASTE")
-                            try {
-                                val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                                    as android.content.ClipboardManager
-                                cm.setPrimaryClip(android.content.ClipData.newPlainText("ussd_amount", response))
-                                // Clear then paste
-                                et.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clearArgs)
-                                et.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                                et.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "❌ Clipboard paste fallback failed: ${e.message}")
-                            }
-                        }
-                    }
-                    break
-                }
-            }
-        } finally {
-            edits.forEach { it.recycle() }
-        }
-
-        if (!typed) {
+        if (!typeIntoActiveEditableField(root, response)) {
             Log.w(TAG, "⚠️ Failed to type flow response into EditText")
             return false
         }
@@ -1817,7 +1806,7 @@ class UssdAccessibilityService : AccessibilityService() {
         // onAccessibilityEvent no longer suppresses TYPE_WINDOW_STATE_CHANGED using this,
         // so the next USSD screen can still be processed immediately.
         setTextSuppressUntilMs = System.currentTimeMillis() + 1500L
-        completedFlowSteps.add(step.order)
+        Log.i(TAG, "USSD[step=${step.order}] WRITE value='$response'")
 
         reportFlowProgress(
             stepOrder = step.order,
@@ -1849,7 +1838,9 @@ class UssdAccessibilityService : AccessibilityService() {
                 }
                 // Never press Send while the dialog input is still empty — carriers
                 // answer "Input required. Try again" and the whole order dies.
-                if (!isValueCommittedInActiveField(rt, response)) {
+                val verified = isValueCommittedInActiveField(rt, response)
+                Log.i(TAG, "USSD[step=${step.order}] VERIFY ${if (verified) "ok" else "retry"} value='$response'")
+                if (!verified) {
                     submitAttempt++
                     if (submitAttempt <= 4) {
                         Log.w(TAG, "⏳ Field not committed yet (attempt $submitAttempt) — retyping '$response' and waiting")
@@ -1869,9 +1860,13 @@ class UssdAccessibilityService : AccessibilityService() {
                         Log.i(TAG, "✅ Sending after $submitAttempt attempts — field has data (len=$filledLen)")
                     }
                 }
-                submitCount++
-                Log.d(TAG, "📨 Non-PIN flow submit step=${step.order} submitCount=$submitCount")
-                clickSendOrOkButton(rt)
+                if (clickSendOrOkButton(rt, allowScheduledSubmit = true, source = "flow-step-${step.order}")) {
+                    completedFlowSteps.add(step.order)
+                    submitCount++
+                    Log.i(TAG, "USSD[step=${step.order}] SEND clicked submitCount=$submitCount")
+                } else {
+                    Log.w(TAG, "USSD[step=${step.order}] SEND failed — no Send/OK button clicked")
+                }
             } finally {
                 if (!rescheduled && scheduledSubmitRunnable === submitRunnable) {
                     awaitingScheduledSubmit = false
@@ -1893,15 +1888,21 @@ class UssdAccessibilityService : AccessibilityService() {
         return try {
             val best = selectBestEditableCandidate(candidates) ?: return false
             val node = best.node
+            clearEditableField(node)
             focusEditableField(node)
             val args = android.os.Bundle().apply {
                 putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
             }
             var ok = try { node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args) } catch (_: Exception) { false }
-            if (!ok) {
+            try { SystemClock.sleep(80L) } catch (_: Exception) {}
+            try { node.refresh() } catch (_: Exception) {}
+            val directText = node.text?.toString().orEmpty()
+            val needsPaste = !ok || (value.contains('.') && !directText.contains('.'))
+            if (needsPaste) {
                 ok = try {
                     val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
                     cm.setPrimaryClip(android.content.ClipData.newPlainText("ussd_value", value))
+                    clearEditableField(node)
                     node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
                     node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
                 } catch (_: Exception) { false }
@@ -2336,17 +2337,17 @@ class UssdAccessibilityService : AccessibilityService() {
     /**
      * Click Send/OK button after entering PIN
      */
-    private fun clickSendOrOkButton(root: AccessibilityNodeInfo) {
+    private fun clickSendOrOkButton(root: AccessibilityNodeInfo, allowScheduledSubmit: Boolean = false, source: String = "auto"): Boolean {
         try {
             val dialogText = extractDialogText(root)
             if (shouldHardStopForPinStage(root, dialogText) && !shouldBypassPinHardStop(dialogText)) {
                 engagePinHardStop(dialogText)
                 Log.i(TAG, "✋ clickSendOrOkButton hard-stopped — PIN dialog requires full manual control")
-                return
+                return false
             }
-            if (shouldSuppressAutoClickForDialog(root, dialogText)) {
+            if (!allowScheduledSubmit && shouldSuppressAutoClickForDialog(root, dialogText)) {
                 Log.i(TAG, "✋ clickSendOrOkButton suppressed — editable dialog awaiting manual action")
-                return
+                return false
             }
             // Priority order: Send > OK > Confirm
             val sendButtons = listOf("Send", "send", "SEND", "Dir", "dir", "DIR", "OK", "ok", "Ok", "Confirm", "confirm")
@@ -2363,11 +2364,11 @@ class UssdAccessibilityService : AccessibilityService() {
                         if (clicked) {
                             clickCount++
                             lastClickTime = System.currentTimeMillis()
-                            Log.d(TAG, "✅ Clicked '$buttonText' after PIN entry (click #$clickCount label='$label')")
+                            Log.d(TAG, "✅ USSD[$source] clicked '$buttonText' (click #$clickCount label='$label' scheduled=$allowScheduledSubmit)")
                             startMultiDialogListener()
                             notifyClickComplete()
                             node.recycle()
-                            return
+                            return true
                         }
                     }
                     node.recycle()
@@ -2379,6 +2380,7 @@ class UssdAccessibilityService : AccessibilityService() {
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error clicking send after PIN: ${e.message}")
         }
+        return false
     }
     
     /**
