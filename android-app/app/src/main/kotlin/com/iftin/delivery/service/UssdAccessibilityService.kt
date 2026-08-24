@@ -1994,6 +1994,10 @@ class UssdAccessibilityService : AccessibilityService() {
                     if (filledLen <= 0) {
                         Log.w(TAG, "⚠️ Field reads empty after $submitAttempt attempts — final write then Send anyway")
                         typeIntoActiveEditableField(rt, response)
+                        if (!isStepValueCommitted(rt, response, responseKind) && !canTrustFilledButUnverifiedStep(rt, response, responseKind)) {
+                            Log.e(TAG, "🛑 USSD[step=${step.order}] SEND blocked — final write did not commit safe ${responseKind.name} value '$response'")
+                            return@Runnable
+                        }
                     } else if (!canTrustFilledButUnverifiedStep(rt, response, responseKind)) {
                         Log.e(TAG, "🛑 USSD[step=${step.order}] SEND blocked — unverified ${responseKind.name} value would be unsafe (expected='$response' len=$filledLen)")
                         return@Runnable
@@ -2048,8 +2052,104 @@ class UssdAccessibilityService : AccessibilityService() {
                     node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
                 } catch (_: Exception) { false }
             }
+            try { SystemClock.sleep(120L) } catch (_: Exception) {}
+            try { node.refresh() } catch (_: Exception) {}
+            val afterPaste = node.text?.toString().orEmpty()
+            if ((!ok || !isVisibleTextEquivalentToExpected(afterPaste, value)) && value.any { it.isDigit() || it == '.' || it == ',' }) {
+                ok = writeWithVisibleImeText(root, value) || ok
+            }
             setTextSuppressUntilMs = System.currentTimeMillis() + 1500L
             ok
+        } finally {
+            candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
+        }
+    }
+
+    private fun isVisibleTextEquivalentToExpected(actual: String, expected: String): Boolean {
+        if (actual == expected) return true
+        val normalizedActual = normalizeFieldValue(actual)
+        val normalizedExpected = normalizeFieldValue(expected)
+        return normalizedExpected.isNotEmpty() && normalizedActual == normalizedExpected
+    }
+
+    private fun keyCharFromLabel(value: String?): Char? {
+        val trimmed = value?.trim().orEmpty()
+        if (trimmed.isBlank()) return null
+        trimmed.firstOrNull { it.isDigit() }?.let { return it }
+        return when {
+            trimmed == "." || trimmed.equals("dot", ignoreCase = true) || trimmed.equals("period", ignoreCase = true) -> '.'
+            trimmed == "," || trimmed.equals("comma", ignoreCase = true) -> '.'
+            else -> null
+        }
+    }
+
+    private fun dispatchGestureText(root: AccessibilityNodeInfo, value: String): Boolean {
+        val needed = value.mapNotNull { ch -> if (ch.isDigit() || ch == '.' || ch == ',') if (ch == ',') '.' else ch else null }.distinct()
+        if (needed.isEmpty()) return false
+        val keyNodes = mutableMapOf<Char, Rect>()
+        fun walk(node: AccessibilityNodeInfo?) {
+            if (node == null) return
+            try {
+                val key = keyCharFromLabel(node.text?.toString()) ?: keyCharFromLabel(node.contentDescription?.toString())
+                if (key != null && key in needed && node.isVisibleToUser) {
+                    val b = resolveGestureTapBounds(node)
+                    if (b.width() > 24 && b.height() > 24) {
+                        val prev = keyNodes[key]
+                        if (prev == null || (b.width() * b.height()) > (prev.width() * prev.height())) {
+                            keyNodes[key] = b
+                        }
+                    }
+                }
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { child ->
+                        try { walk(child) } finally { child.recycle() }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        walk(root)
+        val missing = needed.filter { keyNodes[it] == null }
+        if (missing.isNotEmpty()) {
+            Log.w(TAG, "🎹 visible IME text fallback missing keys=$missing found=${keyNodes.keys}")
+            return false
+        }
+        val builder = GestureDescription.Builder()
+        val interKeyDelayMs = 170L
+        val strokeDurationMs = 65L
+        value.mapNotNull { ch -> if (ch.isDigit() || ch == '.' || ch == ',') if (ch == ',') '.' else ch else null }
+            .forEachIndexed { index, ch ->
+                val b = keyNodes[ch] ?: return false
+                val path = Path().apply { moveTo(b.exactCenterX(), b.exactCenterY()) }
+                builder.addStroke(GestureDescription.StrokeDescription(path, index * interKeyDelayMs, strokeDurationMs))
+            }
+        val dispatched = dispatchGesture(builder.build(), null, null)
+        if (dispatched) {
+            val settleDelay = (value.length * interKeyDelayMs) + strokeDurationMs + 220L
+            SystemClock.sleep(settleDelay)
+        }
+        Log.d(TAG, "🎹 visible IME text fallback dispatched=$dispatched len=${value.length}")
+        return dispatched
+    }
+
+    private fun writeWithVisibleImeText(root: AccessibilityNodeInfo, value: String): Boolean {
+        val candidates = collectEditableFieldCandidates(root)
+        return try {
+            val best = selectBestEditableCandidate(candidates) ?: return false
+            clearEditableField(best.node)
+            focusEditableField(best.node, requireAccessibilityFocus = true)
+            try { SystemClock.sleep(350L) } catch (_: Exception) {}
+            val imeRoots = windows
+                .filter { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+                .mapNotNull { window -> try { window.root } catch (_: Exception) { null } }
+            if (imeRoots.isEmpty()) {
+                Log.w(TAG, "🎹 visible IME text fallback unavailable — keyboard not visible")
+                return false
+            }
+            try {
+                imeRoots.any { imeRoot -> dispatchGestureText(imeRoot, value) }
+            } finally {
+                imeRoots.forEach { try { it.recycle() } catch (_: Exception) {} }
+            }
         } finally {
             candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
         }
