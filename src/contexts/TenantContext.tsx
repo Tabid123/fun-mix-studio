@@ -74,7 +74,12 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
   // The storefront slug from the current URL (`?t=slug`) — reactive, so
   // navigating between two reseller links never keeps the old tenant.
   const [searchParams] = useSearchParams();
+  const { pathname } = useLocation();
   const urlSlug = (searchParams.get('t') ?? '').trim().toLowerCase() || null;
+
+  // Auth screens are brand-neutral: never resolve a saved/subdomain slug there,
+  // otherwise the previous tenant's colors bleed into the login page.
+  const isAuthRoute = /^\/(reseller\/)?(login|auth|signup|register)/.test(pathname);
 
   useEffect(() => {
     if (!urlSlug) return;
@@ -83,7 +88,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
 
   // Anonymous storefront branding (logo + primary color) via public RPC
   const loadPublicTenant = useCallback(async () => {
-    const slug = urlSlug ?? fallbackPublicSlug();
+    const slug = urlSlug ?? (isAuthRoute ? null : fallbackPublicSlug());
     if (!slug) { setPublicTenant(null); setPublicLoading(false); return; }
     setPublicTenant(null);
     const { data, error } = await supabase.rpc('get_tenant_by_slug', { _slug: slug });
@@ -91,6 +96,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
     // flight — never re-apply the old tenant's branding in that case.
     const stillCurrent = urlSlug ? urlSlug === slug : fallbackPublicSlug() === slug;
     if (!stillCurrent) { setPublicTenant(null); setPublicLoading(false); return; }
+
     if (error || !data || !(data as any[]).length) {
       setPublicTenant(null);
       setPublicLoading(false);
