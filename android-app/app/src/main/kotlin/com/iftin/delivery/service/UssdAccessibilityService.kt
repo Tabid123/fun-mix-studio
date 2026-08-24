@@ -1272,6 +1272,7 @@ class UssdAccessibilityService : AccessibilityService() {
     private fun dialogLooksLikeAmountPrompt(text: String?): Boolean {
         val lower = text.orEmpty().lowercase()
         if (lower.isBlank() || looksLikeNumberedMenu(lower)) return false
+        if (dialogLooksLikePinPrompt(lower)) return false
         return listOf(
             "geli lacag", "lacagta", "qiimaha", "qiimo", "amount", "enter amount",
             "dollar", "usd", "wadarta", "total", "mount"
@@ -1281,6 +1282,8 @@ class UssdAccessibilityService : AccessibilityService() {
     private fun dialogLooksLikeReceiverPrompt(text: String?): Boolean {
         val lower = text.orEmpty().lowercase()
         if (lower.isBlank() || looksLikeNumberedMenu(lower)) return false
+        // "lambarka sirta" means secret/PIN number, not receiver phone.
+        if (dialogLooksLikePinPrompt(lower)) return false
         return listOf(
             "geli mobil", "geli mobile", "mobilka", "mobile", "lambarka", "lambar",
             "number", "phone", "taleefan", "telefoon", "receiver", "reciver",
@@ -1771,11 +1774,7 @@ class UssdAccessibilityService : AccessibilityService() {
             pinWriteFailedForSession = false
             pinSetCount = 0
         }
-        val looksLikePinDialog = !isMenuList && (
-            lower.contains("pin") ||
-                lower.contains("password") ||
-                lower.contains("furaha")
-        )
+        val looksLikePinDialog = dialogLooksLikePinPrompt(dialogText)
         val unansweredSteps = flow.steps.filter { it.order !in completedFlowSteps }
         val expectedNextOrder = (completedFlowSteps.maxOrNull() ?: 0) + 1
         val keywordMatches = unansweredSteps.filter { s ->
