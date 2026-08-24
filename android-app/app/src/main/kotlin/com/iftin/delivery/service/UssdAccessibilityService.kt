@@ -1785,36 +1785,46 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         var submitAttempt = 0
         lateinit var submitRunnable: Runnable
+        awaitingScheduledSubmit = true
         submitRunnable = Runnable {
-            val rt = rootInActiveWindow ?: return@Runnable
+            val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
             var rescheduled = false
             try {
                 // Never press Send while the dialog input is still empty — carriers
                 // answer "Input required. Try again" and the whole order dies.
                 if (!isValueCommittedInActiveField(rt, response)) {
                     submitAttempt++
-                    if (submitAttempt <= 3) {
+                    if (submitAttempt <= 2) {
                         Log.w(TAG, "⏳ Field not committed yet (attempt $submitAttempt) — retyping '$response' and waiting")
                         typeIntoActiveEditableField(rt, response)
-                        handler.postDelayed(submitRunnable, SUBMIT_RECHECK_DELAY_MS)
+                        handler.postDelayed(submitRunnable, RECHECK_DELAY_MS)
                         rescheduled = true
                         return@Runnable
                     }
-                    Log.e(TAG, "❌ Skipping Send — input field still empty after $submitAttempt attempts")
-                    return@Runnable
+                    // Same final fallback as the PIN path: if the field visibly holds
+                    // data (even unreadable/masked), press Send instead of giving up.
+                    val filledLen = activeFieldFilledLength(rt)
+                    if (filledLen <= 0) {
+                        Log.e(TAG, "❌ Skipping Send — input field still empty after $submitAttempt attempts")
+                        return@Runnable
+                    }
+                    Log.i(TAG, "✅ Sending after $submitAttempt attempts — field has data (len=$filledLen)")
                 }
                 submitCount++
                 Log.d(TAG, "📨 Non-PIN flow submit step=${step.order} submitCount=$submitCount")
                 clickSendOrOkButton(rt)
             } finally {
-                if (!rescheduled) { try { rt.recycle() } catch (_: Exception) {} } else { try { rt.recycle() } catch (_: Exception) {} }
+                if (!rescheduled) {
+                    awaitingScheduledSubmit = false
+                    scheduledSubmitRunnable = null
+                }
+                try { rt.recycle() } catch (_: Exception) {}
             }
         }
         scheduledSubmitRunnable = submitRunnable
-        // Give the EditText enough time to commit the typed value before pressing
-        // Send. Some carrier dialogs (Somtel/Hormuud) fire "Input required, Try again"
-        // if Send is dispatched too quickly after ACTION_SET_TEXT / PASTE.
-        handler.postDelayed(submitRunnable, NON_PIN_SUBMIT_DELAY_MS)
+        // Unified delay: give the EditText time to commit before pressing Send.
+        handler.postDelayed(submitRunnable, SUBMIT_DELAY_MS)
+
         return true
     }
 
