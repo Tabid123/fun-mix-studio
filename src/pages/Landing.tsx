@@ -9,7 +9,6 @@ import {
   CheckCircle2,
   Check,
 } from 'lucide-react';
-import iftinLogo from '@/assets/iftin-logo.png';
 import ContactDialog from '@/components/landing/ContactDialog';
 import heroDashboard from '@/assets/landing/hero-dashboard.jpg';
 import missionYouth from '@/assets/landing/mission-youth.jpg';
