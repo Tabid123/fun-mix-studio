@@ -1811,10 +1811,11 @@ class UssdAccessibilityService : AccessibilityService() {
         )
 
         // Schedule a single Send/OK click for this non-PIN step.
-        // Reuse the same serialized scheduler — but allow it to fire even after
-        // a previous non-PIN submit, since each menu page = its own submit.
-        // For non-PIN steps we use a fresh runnable that doesn't gate on pinSubmittedForSession.
+        // Bound to THIS dialog: a pending runnable from an earlier step must never
+        // retype its old value into a newer dialog (Somnet "wrong value first" bug).
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+        val mySignature = dialogSignature(root)
+        submitDialogSignature = mySignature
         var submitAttempt = 0
         lateinit var submitRunnable: Runnable
         awaitingScheduledSubmit = true
@@ -1822,31 +1823,39 @@ class UssdAccessibilityService : AccessibilityService() {
             val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
             var rescheduled = false
             try {
+                // Stale-dialog guard: the screen already moved on — do nothing.
+                val liveSignature = dialogSignature(rt)
+                if (mySignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != mySignature) {
+                    Log.w(TAG, "🚫 Stale submit dropped — dialog changed (was='${mySignature.take(24)}' now='${liveSignature.take(24)}')")
+                    return@Runnable
+                }
                 // Never press Send while the dialog input is still empty — carriers
                 // answer "Input required. Try again" and the whole order dies.
                 if (!isValueCommittedInActiveField(rt, response)) {
                     submitAttempt++
-                    if (submitAttempt <= 2) {
+                    if (submitAttempt <= 4) {
                         Log.w(TAG, "⏳ Field not committed yet (attempt $submitAttempt) — retyping '$response' and waiting")
                         typeIntoActiveEditableField(rt, response)
                         handler.postDelayed(submitRunnable, RECHECK_DELAY_MS)
                         rescheduled = true
                         return@Runnable
                     }
-                    // Same final fallback as the PIN path: if the field visibly holds
-                    // data (even unreadable/masked), press Send instead of giving up.
+                    // Never stall the order: after the retries, press Send as long as
+                    // the field visibly holds data; if it reads empty, write once more
+                    // and still press Send (unreadable fields must not block the flow).
                     val filledLen = activeFieldFilledLength(rt)
                     if (filledLen <= 0) {
-                        Log.e(TAG, "❌ Skipping Send — input field still empty after $submitAttempt attempts")
-                        return@Runnable
+                        Log.w(TAG, "⚠️ Field reads empty after $submitAttempt attempts — final write then Send anyway")
+                        typeIntoActiveEditableField(rt, response)
+                    } else {
+                        Log.i(TAG, "✅ Sending after $submitAttempt attempts — field has data (len=$filledLen)")
                     }
-                    Log.i(TAG, "✅ Sending after $submitAttempt attempts — field has data (len=$filledLen)")
                 }
                 submitCount++
                 Log.d(TAG, "📨 Non-PIN flow submit step=${step.order} submitCount=$submitCount")
                 clickSendOrOkButton(rt)
             } finally {
-                if (!rescheduled) {
+                if (!rescheduled && scheduledSubmitRunnable === submitRunnable) {
                     awaitingScheduledSubmit = false
                     scheduledSubmitRunnable = null
                 }
