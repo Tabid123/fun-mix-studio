@@ -46,7 +46,6 @@ const Landing = () => {
       <header className="sticky top-0 z-40 border-b border-[#dbe1ff] bg-[#f8f9ff]/90 backdrop-blur">
         <div className="mx-auto flex max-w-[1280px] items-center justify-between px-5 py-4 md:px-20">
           <div className="flex items-center gap-2.5">
-            <img src={iftinLogo} alt={`${brandName} logo`} className="h-8 w-8 rounded-lg object-cover" />
             <span className="text-[17px] font-extrabold tracking-tight" style={{ color: BRAND }}>
               {brandName}
             </span>
