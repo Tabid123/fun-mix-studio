@@ -1338,7 +1338,9 @@ class UssdAccessibilityService : AccessibilityService() {
                 if (fuzzy != null) return fuzzy.first
             }
         }
-        return fallback.ifBlank { "1" }
+        // Never invent a choice: if nothing matched and no fallback was configured,
+        // return blank so the caller aborts instead of typing a guessed "1".
+        return fallback
     }
 
     private fun matchingPendingStep(dialogText: String): UssdFlowsClient.FlowStep? {
@@ -2712,6 +2714,15 @@ class UssdAccessibilityService : AccessibilityService() {
         // can fire before the value is typed (the Somnet symptom).
         if (awaitingScheduledSubmit) {
             Log.i(TAG, "🛑 Suppressing auto-click — scheduled submit is pending")
+            return true
+        }
+
+        // If this dialog matches a pending flow step, the dynamic flow handler owns
+        // it. Never let the generic loop press Send — Somnet opens dialogs whose
+        // EditText is not yet in the accessibility tree, so the "empty field" check
+        // below can't see it and Send fires with nothing typed ("Input required").
+        if (!dialogText.isNullOrBlank() && matchingPendingStep(dialogText) != null) {
+            Log.i(TAG, "🛑 Suppressing auto-click — pending flow step owns this dialog")
             return true
         }
         if (shouldHardStopForPinStage(root, dialogText)) {
