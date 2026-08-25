@@ -1355,6 +1355,17 @@ class UssdAccessibilityService : AccessibilityService() {
             pending.firstOrNull { flowResponseKind(it) == FlowResponseKind.MENU_CHOICE && flowStepMatchesContent(it, dialogText) }
                 ?.let { return it }
         }
+        if (dialogLooksLikeReceiverConfirmationPrompt(dialogText)) {
+            pending.firstOrNull {
+                flowResponseKind(it) == FlowResponseKind.RECEIVER &&
+                    it.keywords.any { kw ->
+                        val k = kw.lowercase()
+                        k.contains("hubi") || k.contains("confirm") || k.contains("xaqiiji")
+                    }
+            }?.let { return it }
+            pending.firstOrNull { flowResponseKind(it) == FlowResponseKind.RECEIVER && flowStepMatchesContent(it, dialogText) }
+                ?.let { return it }
+        }
         return pending.firstOrNull { flowStepMatchesContent(it, dialogText) }
     }
 
@@ -1396,6 +1407,16 @@ class UssdAccessibilityService : AccessibilityService() {
             "number", "phone", "taleefan", "telefoon", "receiver", "reciver",
             "hubi mobil", "confirm number", "xaqiiji lambarka"
         ).any { lower.contains(it) }
+    }
+
+    private fun dialogLooksLikeReceiverConfirmationPrompt(text: String?): Boolean {
+        val lower = text.orEmpty().lowercase()
+        if (lower.isBlank() || looksLikeNumberedMenu(lower)) return false
+        if (dialogLooksLikePinPrompt(lower)) return false
+        return lower.contains("hubi mobil") ||
+            lower.contains("confirm number") ||
+            lower.contains("xaqiiji lambarka") ||
+            lower.contains("hubi lambarka")
     }
 
     private fun dialogLooksLikeMenuChoicePrompt(text: String?): Boolean {
