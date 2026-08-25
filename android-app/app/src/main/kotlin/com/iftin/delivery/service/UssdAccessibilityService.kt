@@ -2708,6 +2708,16 @@ class UssdAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun flowSessionHasPendingSteps(): Boolean {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(KEY_EXPECTING_USSD, false)) return false
+        val flow = try {
+            UssdFlowsClient.findFlowById(prefs.getString("current_ussd_flow_id", null))
+                ?: UssdFlowsClient.findFlowForTrigger(prefs.getString("current_trigger_code", null))
+        } catch (_: Exception) { null } ?: return false
+        return flow.steps.any { it.order !in completedFlowSteps }
+    }
+
     private fun shouldSuppressAutoClickForDialog(root: AccessibilityNodeInfo, dialogText: String?): Boolean {
         // A scheduled write -> verify -> send sequence owns this dialog. The generic
         // auto-click loop must stay out of the way until it has run, otherwise Send
@@ -2716,6 +2726,7 @@ class UssdAccessibilityService : AccessibilityService() {
             Log.i(TAG, "🛑 Suppressing auto-click — scheduled submit is pending")
             return true
         }
+
 
         // If this dialog matches a pending flow step, the dynamic flow handler owns
         // it. Never let the generic loop press Send — Somnet opens dialogs whose
