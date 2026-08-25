@@ -1753,8 +1753,11 @@ class UssdAccessibilityService : AccessibilityService() {
             // session ends cleanly (no lingering dialog, no stale intermediate text).
             val isUnansweredChoiceDialog = !dialogText.isNullOrBlank() &&
                 (looksLikeNumberedMenu(dialogText) || hasUnansweredChoiceStep(dialogText))
-                val pendingContentStep = dialogText?.let(::matchingPendingStep)
-                if (isTerminalResultDialog(source) && !isUnansweredChoiceDialog && pendingContentStep == null) {
+            val pendingContentStep = dialogText?.let(::matchingPendingStep)
+            val pendingInputPrompt = !dialogText.isNullOrBlank() &&
+                flowSessionHasPendingSteps() &&
+                (dialogLooksLikeReceiverPrompt(dialogText) || dialogLooksLikeAmountPrompt(dialogText) || dialogLooksLikePinPrompt(dialogText))
+            if (isTerminalResultDialog(source) && !isUnansweredChoiceDialog && pendingContentStep == null && !pendingInputPrompt) {
                 if (!dialogText.isNullOrBlank()) {
                     saveUssdResponse(dialogText, isFinal = true)
                 }
