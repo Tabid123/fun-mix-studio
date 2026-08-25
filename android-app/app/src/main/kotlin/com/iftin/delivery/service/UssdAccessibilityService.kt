@@ -2063,14 +2063,19 @@ class UssdAccessibilityService : AccessibilityService() {
 
         val initialSignature = dialogSignature(root)
         val attemptKey = "${step.order}:$response:${initialSignature.take(80)}"
-        if (attemptKey == lastAttemptKey) {
-            Log.i(TAG, "USSD[step=${step.order}] duplicate write permanently suppressed for this dialog")
-            return true
-        }
-
         if (response.isBlank()) {
             Log.w(TAG, "⚠️ Flow step #${step.order} matched but response is empty")
             return false
+        }
+
+        if (attemptKey == lastAttemptKey) {
+            val duplicateReceiverStillEmpty = flowResponseKind(step) == FlowResponseKind.RECEIVER &&
+                !isReceiverCommittedInActiveField(root, response)
+            if (!duplicateReceiverStillEmpty) {
+                Log.i(TAG, "USSD[step=${step.order}] duplicate write permanently suppressed for this dialog")
+                return true
+            }
+            Log.w(TAG, "🔁 USSD[step=${step.order}] duplicate receiver dialog is still empty — retrying exact receiver write")
         }
 
         // Validate PIN: only proceed if response is purely numeric for PIN steps
@@ -2134,8 +2139,18 @@ class UssdAccessibilityService : AccessibilityService() {
             )
         }
 
-        if (!typeIntoActiveEditableField(root, response)) {
+        val requiresVisibleCommitBeforeSubmit = responseKind == FlowResponseKind.RECEIVER
+        if (!typeIntoActiveEditableField(root, response, requireVisibleCommit = requiresVisibleCommitBeforeSubmit)) {
             Log.w(TAG, "⚠️ Failed to type flow response into EditText")
+            if (responseKind == FlowResponseKind.RECEIVER) {
+                return scheduleReceiverWriteRetry(
+                    step = step,
+                    totalSteps = flow.steps.size,
+                    response = response,
+                    dialogText = dialogText,
+                    signature = initialSignature
+                )
+            }
             return false
         }
         lastAttemptKey = attemptKey
@@ -2197,6 +2212,9 @@ class UssdAccessibilityService : AccessibilityService() {
                         rescheduled = true
                     } else {
                         Log.e(TAG, "🛑 USSD[step=${step.order}] VERIFY failed — Send blocked; value will not be cleared or rewritten")
+                        if (responseKind == FlowResponseKind.RECEIVER) {
+                            scheduleReceiverWriteRetry(step, flow.steps.size, response, liveDialogText.orEmpty(), liveSignature.ifBlank { mySignature })
+                        }
                     }
                     return@Runnable
                 }
@@ -2371,8 +2389,157 @@ class UssdAccessibilityService : AccessibilityService() {
         return true
     }
 
-    /** Write [value] exactly once into the active field. No clear/rewrite/fallback chain. */
-    private fun typeIntoActiveEditableField(root: AccessibilityNodeInfo, value: String): Boolean {
+    /**
+     * Receiver fields can briefly accept ACTION_SET_TEXT while still reporting blank
+     * in the live accessibility tree. Keep ownership of the same dialog and retry the
+     * same value until it is visible; do not press Send and do not switch steps.
+     */
+    private fun scheduleReceiverWriteRetry(
+        step: UssdFlowsClient.FlowStep,
+        totalSteps: Int,
+        response: String,
+        dialogText: String,
+        signature: String
+    ): Boolean {
+        scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+        submitDialogSignature = signature
+        scheduledStepOrder = step.order
+        val scheduledSession = ussdSessionToken
+        awaitingScheduledSubmit = true
+        var attempt = 0
+        lateinit var retryRunnable: Runnable
+        retryRunnable = Runnable {
+            val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
+            var rescheduled = false
+            try {
+                val liveText = extractDialogText(rt) ?: dialogText
+                val liveSignature = dialogSignature(rt)
+                if (scheduledSession != ussdSessionToken ||
+                    ((signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) &&
+                        !dialogLooksLikeReceiverConfirmationPrompt(liveText))
+                ) {
+                    Log.w(TAG, "🚫 Receiver write retry dropped — dialog changed")
+                    return@Runnable
+                }
+                if (isReceiverCommittedInActiveField(rt, response)) {
+                    scheduledSubmitRunnable = null
+                    awaitingScheduledSubmit = false
+                    submitDialogSignature = ""
+                    scheduledStepOrder = -1
+                    scheduleVerifiedStepSubmit(step, totalSteps, response, FlowResponseKind.RECEIVER, liveText, signature)
+                    return@Runnable
+                }
+                if (!hasVisibleEditableInput(rt)) {
+                    if (++attempt <= 10) {
+                        Log.i(TAG, "⏳ USSD[step=${step.order}] receiver field not ready attempt=$attempt")
+                        handler.postDelayed(retryRunnable, RECHECK_DELAY_MS)
+                        rescheduled = true
+                    } else {
+                        Log.e(TAG, "🛑 USSD[step=${step.order}] receiver field never became ready; Send blocked")
+                    }
+                    return@Runnable
+                }
+                val wrote = typeIntoActiveEditableField(rt, response, requireVisibleCommit = true)
+                if (!wrote || !isReceiverCommittedInActiveField(rt, response)) {
+                    if (++attempt <= 10) {
+                        Log.w(TAG, "⏳ USSD[step=${step.order}] receiver write not visible attempt=$attempt — retrying same number")
+                        handler.postDelayed(retryRunnable, RECHECK_DELAY_MS)
+                        rescheduled = true
+                    } else {
+                        Log.e(TAG, "🛑 USSD[step=${step.order}] receiver was not committed after $attempt attempts; Send blocked")
+                    }
+                    return@Runnable
+                }
+                lastAttemptKey = "${step.order}:$response:${signature.take(80)}"
+                lastAttemptAtMs = System.currentTimeMillis()
+                setTextSuppressUntilMs = System.currentTimeMillis() + 1500L
+                Log.i(TAG, "USSD[step=${step.order}] WRITE receiver committed after retry")
+                reportFlowProgress(
+                    stepOrder = step.order,
+                    totalSteps = totalSteps,
+                    keywords = step.keywords,
+                    response = response,
+                    dialogText = liveText.take(200),
+                    isPin = false
+                )
+                scheduledSubmitRunnable = null
+                awaitingScheduledSubmit = false
+                submitDialogSignature = ""
+                scheduledStepOrder = -1
+                scheduleVerifiedStepSubmit(step, totalSteps, response, FlowResponseKind.RECEIVER, liveText, signature)
+            } finally {
+                if (!rescheduled && scheduledSubmitRunnable === retryRunnable) {
+                    scheduledSubmitRunnable = null
+                    awaitingScheduledSubmit = false
+                    submitDialogSignature = ""
+                    scheduledStepOrder = -1
+                }
+                try { rt.recycle() } catch (_: Exception) {}
+            }
+        }
+        scheduledSubmitRunnable = retryRunnable
+        handler.postDelayed(retryRunnable, RECHECK_DELAY_MS)
+        return true
+    }
+
+    /** Schedule Send only after the value is already committed in the active field. */
+    private fun scheduleVerifiedStepSubmit(
+        step: UssdFlowsClient.FlowStep,
+        totalSteps: Int,
+        response: String,
+        responseKind: FlowResponseKind,
+        dialogText: String,
+        signature: String
+    ) {
+        scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+        submitDialogSignature = signature
+        scheduledStepOrder = step.order
+        val scheduledSession = ussdSessionToken
+        awaitingScheduledSubmit = true
+        lateinit var submitRunnable: Runnable
+        submitRunnable = Runnable {
+            val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
+            try {
+                val liveText = extractDialogText(rt) ?: dialogText
+                val liveSignature = dialogSignature(rt)
+                if (scheduledSession != ussdSessionToken ||
+                    ((signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) &&
+                        !isSamePendingStepOnLiveDialog(liveText, step.order) &&
+                        !dialogLooksLikeReceiverConfirmationPrompt(liveText))
+                ) {
+                    Log.w(TAG, "🚫 Verified submit dropped — dialog changed")
+                    return@Runnable
+                }
+                val verified = isStepValueCommitted(rt, response, responseKind)
+                Log.i(TAG, "USSD[step=${step.order}] VERIFY ${if (verified) "ok" else "failed"} value='$response'")
+                if (!verified) {
+                    Log.e(TAG, "🛑 USSD[step=${step.order}] verified submit blocked — value disappeared before Send")
+                    scheduleReceiverWriteRetry(step, totalSteps, response, liveText, liveSignature.ifBlank { signature })
+                    return@Runnable
+                }
+                if (clickSendOrOkButton(rt, allowScheduledSubmit = true, source = "flow-step-${step.order}-verified")) {
+                    markFlowStepCompleted(step.order)
+                    submitCount++
+                    Log.i(TAG, "USSD[step=${step.order}] SEND clicked submitCount=$submitCount")
+                } else {
+                    Log.w(TAG, "USSD[step=${step.order}] SEND failed — no Send/OK button clicked")
+                }
+            } finally {
+                if (scheduledSubmitRunnable === submitRunnable) {
+                    awaitingScheduledSubmit = false
+                    scheduledSubmitRunnable = null
+                    submitDialogSignature = ""
+                    scheduledStepOrder = -1
+                }
+                try { rt.recycle() } catch (_: Exception) {}
+            }
+        }
+        scheduledSubmitRunnable = submitRunnable
+        handler.postDelayed(submitRunnable, SUBMIT_DELAY_MS)
+    }
+
+    /** Write [value] into the active field. Receiver requires visible commit before success. */
+    private fun typeIntoActiveEditableField(root: AccessibilityNodeInfo, value: String, requireVisibleCommit: Boolean = false): Boolean {
         val candidates = collectEditableFieldCandidates(root)
         return try {
             val best = selectBestEditableCandidate(candidates) ?: return false
@@ -2390,7 +2557,7 @@ class UssdAccessibilityService : AccessibilityService() {
                 TAG,
                 "USSD WRITE ONCE result committed=$committed setText=$setTextAccepted visibleLen=${visibleText.length}"
             )
-            committed || (visibleText.isBlank() && setTextAccepted)
+            committed || (!requireVisibleCommit && visibleText.isBlank() && setTextAccepted)
         } finally {
             candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
         }
