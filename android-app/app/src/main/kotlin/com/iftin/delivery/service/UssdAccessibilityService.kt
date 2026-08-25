@@ -2063,14 +2063,19 @@ class UssdAccessibilityService : AccessibilityService() {
 
         val initialSignature = dialogSignature(root)
         val attemptKey = "${step.order}:$response:${initialSignature.take(80)}"
-        if (attemptKey == lastAttemptKey) {
-            Log.i(TAG, "USSD[step=${step.order}] duplicate write permanently suppressed for this dialog")
-            return true
-        }
-
         if (response.isBlank()) {
             Log.w(TAG, "⚠️ Flow step #${step.order} matched but response is empty")
             return false
+        }
+
+        if (attemptKey == lastAttemptKey) {
+            val duplicateReceiverStillEmpty = flowResponseKind(step) == FlowResponseKind.RECEIVER &&
+                !isReceiverCommittedInActiveField(root, response)
+            if (!duplicateReceiverStillEmpty) {
+                Log.i(TAG, "USSD[step=${step.order}] duplicate write permanently suppressed for this dialog")
+                return true
+            }
+            Log.w(TAG, "🔁 USSD[step=${step.order}] duplicate receiver dialog is still empty — retrying exact receiver write")
         }
 
         // Validate PIN: only proceed if response is purely numeric for PIN steps
@@ -2134,8 +2139,18 @@ class UssdAccessibilityService : AccessibilityService() {
             )
         }
 
-        if (!typeIntoActiveEditableField(root, response)) {
+        val requiresVisibleCommitBeforeSubmit = responseKind == FlowResponseKind.RECEIVER
+        if (!typeIntoActiveEditableField(root, response, requireVisibleCommit = requiresVisibleCommitBeforeSubmit)) {
             Log.w(TAG, "⚠️ Failed to type flow response into EditText")
+            if (responseKind == FlowResponseKind.RECEIVER) {
+                return scheduleReceiverWriteRetry(
+                    step = step,
+                    totalSteps = flow.steps.size,
+                    response = response,
+                    dialogText = dialogText,
+                    signature = initialSignature
+                )
+            }
             return false
         }
         lastAttemptKey = attemptKey
