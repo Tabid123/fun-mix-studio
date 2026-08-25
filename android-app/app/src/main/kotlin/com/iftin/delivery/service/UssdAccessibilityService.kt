@@ -1976,8 +1976,8 @@ class UssdAccessibilityService : AccessibilityService() {
 
         val attemptKey = "${step.order}:$response:${dialogSignature(root).take(80)}"
         val attemptNow = System.currentTimeMillis()
-        if (attemptKey == lastAttemptKey && attemptNow - lastAttemptAtMs < ATTEMPT_DEBOUNCE_MS) {
-            Log.i(TAG, "USSD[step=${step.order}] duplicate attempt suppressed")
+        if (attemptKey == lastAttemptKey) {
+            Log.i(TAG, "USSD[step=${step.order}] duplicate write permanently suppressed for this dialog")
             return true
         }
         lastAttemptKey = attemptKey
