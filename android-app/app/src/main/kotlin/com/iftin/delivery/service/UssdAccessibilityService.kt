@@ -1830,9 +1830,10 @@ class UssdAccessibilityService : AccessibilityService() {
                     "matches=${keywordMatches.map { it.order }} dialog=${dialogText.take(120)}"
             )
         }
-        val matchedStep = compatibleKeywordMatches.firstOrNull { it.order == expectedNextOrder }
-            ?: compatibleKeywordMatches.minByOrNull { it.order }
         val expectedStep = flow.steps.firstOrNull { it.order == expectedNextOrder }
+        // Never jump to a later response merely because its broad keyword appears in
+        // carrier boilerplate. Only the exact next step may answer this dialog.
+        val matchedStep = compatibleKeywordMatches.firstOrNull { it.order == expectedNextOrder }
         val step = matchedStep ?: expectedStep?.takeIf { s ->
                 !s.isPinField &&
                 completedFlowSteps.isNotEmpty() &&
@@ -2044,7 +2045,9 @@ class UssdAccessibilityService : AccessibilityService() {
                         Log.i(TAG, "✅ Sending after $submitAttempt attempts — field has data (len=$filledLen)")
                     }
                 }
-                if (clickSendOrOkButton(rt, allowScheduledSubmit = true, source = "flow-step-${step.order}")) {
+                val sendClicked = clickSendOrOkButton(rt, allowScheduledSubmit = true, source = "flow-step-${step.order}") ||
+                    (responseKind == FlowResponseKind.MENU_CHOICE && clickNumberedMenuOption(rt, response))
+                if (sendClicked) {
                     completedFlowSteps.add(step.order)
                     submitCount++
                     Log.i(TAG, "USSD[step=${step.order}] SEND clicked submitCount=$submitCount")
@@ -2520,7 +2523,7 @@ class UssdAccessibilityService : AccessibilityService() {
         return try {
             nodes.any { n ->
                 val label = (n.text?.toString() ?: n.contentDescription?.toString()).orEmpty().trim()
-                val isOption = Regex("^$choice\\s*[.)-]").containsMatchIn(label)
+                val isOption = Regex("^${Regex.escape(choice)}\\s*[.:)-]").containsMatchIn(label)
                 if (isOption && n.isVisibleToUser) {
                     var target: AccessibilityNodeInfo? = n
                     while (target != null && !target.isClickable) target = target.parent
