@@ -1355,7 +1355,23 @@ class UssdAccessibilityService : AccessibilityService() {
             pending.firstOrNull { flowResponseKind(it) == FlowResponseKind.MENU_CHOICE && flowStepMatchesContent(it, dialogText) }
                 ?.let { return it }
         }
+        if (dialogLooksLikeReceiverConfirmationPrompt(dialogText)) {
+            pending.firstOrNull {
+                flowResponseKind(it) == FlowResponseKind.RECEIVER &&
+                    it.keywords.any { kw ->
+                        val k = kw.lowercase()
+                        k.contains("hubi") || k.contains("confirm") || k.contains("xaqiiji")
+                    }
+            }?.let { return it }
+            pending.firstOrNull { flowResponseKind(it) == FlowResponseKind.RECEIVER && flowStepMatchesContent(it, dialogText) }
+                ?.let { return it }
+        }
         return pending.firstOrNull { flowStepMatchesContent(it, dialogText) }
+    }
+
+    private fun isSamePendingStepOnLiveDialog(dialogText: String?, stepOrder: Int): Boolean {
+        if (dialogText.isNullOrBlank() || stepOrder < 0) return false
+        return matchingPendingStep(dialogText)?.order == stepOrder
     }
 
     private fun flowResponseKind(step: UssdFlowsClient.FlowStep): FlowResponseKind {
@@ -1396,6 +1412,16 @@ class UssdAccessibilityService : AccessibilityService() {
             "number", "phone", "taleefan", "telefoon", "receiver", "reciver",
             "hubi mobil", "confirm number", "xaqiiji lambarka"
         ).any { lower.contains(it) }
+    }
+
+    private fun dialogLooksLikeReceiverConfirmationPrompt(text: String?): Boolean {
+        val lower = text.orEmpty().lowercase()
+        if (lower.isBlank() || looksLikeNumberedMenu(lower)) return false
+        if (dialogLooksLikePinPrompt(lower)) return false
+        return lower.contains("hubi mobil") ||
+            lower.contains("confirm number") ||
+            lower.contains("xaqiiji lambarka") ||
+            lower.contains("hubi lambarka")
     }
 
     private fun dialogLooksLikeMenuChoicePrompt(text: String?): Boolean {
@@ -1642,12 +1668,17 @@ class UssdAccessibilityService : AccessibilityService() {
             // A genuinely NEW dialog page invalidates any pending submit from the
             // previous page — otherwise its retype writes the old value here.
             if (lastDialogFingerprint.isNotBlank() && dialogFingerprint != lastDialogFingerprint && scheduledSubmitRunnable != null) {
-                scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
-                scheduledSubmitRunnable = null
-                awaitingScheduledSubmit = false
-                submitDialogSignature = ""
-        scheduledStepOrder = -1
-                Log.d(TAG, "🧹 New dialog page — dropped pending submit from previous page")
+                val samePendingStep = isSamePendingStepOnLiveDialog(eventDialogText, scheduledStepOrder)
+                if (samePendingStep) {
+                    Log.d(TAG, "⏳ Dialog signature changed while same step is still rendering — keeping pending submit/retry")
+                } else {
+                    scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+                    scheduledSubmitRunnable = null
+                    awaitingScheduledSubmit = false
+                    submitDialogSignature = ""
+                    scheduledStepOrder = -1
+                    Log.d(TAG, "🧹 New dialog page — dropped pending submit from previous page")
+                }
             }
             lastDialogFingerprint = dialogFingerprint
         }
@@ -1722,8 +1753,11 @@ class UssdAccessibilityService : AccessibilityService() {
             // session ends cleanly (no lingering dialog, no stale intermediate text).
             val isUnansweredChoiceDialog = !dialogText.isNullOrBlank() &&
                 (looksLikeNumberedMenu(dialogText) || hasUnansweredChoiceStep(dialogText))
-                val pendingContentStep = dialogText?.let(::matchingPendingStep)
-                if (isTerminalResultDialog(source) && !isUnansweredChoiceDialog && pendingContentStep == null) {
+            val pendingContentStep = dialogText?.let(::matchingPendingStep)
+            val pendingInputPrompt = !dialogText.isNullOrBlank() &&
+                flowSessionHasPendingSteps() &&
+                (dialogLooksLikeReceiverPrompt(dialogText) || dialogLooksLikeAmountPrompt(dialogText) || dialogLooksLikePinPrompt(dialogText))
+            if (isTerminalResultDialog(source) && !isUnansweredChoiceDialog && pendingContentStep == null && !pendingInputPrompt) {
                 if (!dialogText.isNullOrBlank()) {
                     saveUssdResponse(dialogText, isFinal = true)
                 }
@@ -1912,6 +1946,18 @@ class UssdAccessibilityService : AccessibilityService() {
                     flowResponseKind(it) == FlowResponseKind.MENU_CHOICE && flowStepMatchesContent(it, dialogText)
                 }
             } else null
+        } ?: run {
+            if (dialogLooksLikeReceiverConfirmationPrompt(dialogText)) {
+                unansweredSteps.firstOrNull {
+                    flowResponseKind(it) == FlowResponseKind.RECEIVER &&
+                        it.keywords.any { kw ->
+                            val k = kw.lowercase()
+                            k.contains("hubi") || k.contains("confirm") || k.contains("xaqiiji")
+                        }
+                } ?: unansweredSteps.firstOrNull {
+                    flowResponseKind(it) == FlowResponseKind.RECEIVER && flowStepMatchesContent(it, dialogText)
+                }
+            } else null
         } ?: unansweredSteps.firstOrNull { flowStepMatchesContent(it, dialogText) }
         if (step == null) {
             Log.d(TAG, "ℹ️ Flow ${flow.triggerCode}: no step matched. completed=$completedFlowSteps dialog=${dialogText.take(120)}")
@@ -1981,7 +2027,8 @@ class UssdAccessibilityService : AccessibilityService() {
             Log.i(TAG, "USSD[step=${step.order}] MENU resolved choice='$response'")
         }
 
-        val attemptKey = "${step.order}:$response:${dialogSignature(root).take(80)}"
+        val initialSignature = dialogSignature(root)
+        val attemptKey = "${step.order}:$response:${initialSignature.take(80)}"
         if (attemptKey == lastAttemptKey) {
             Log.i(TAG, "USSD[step=${step.order}] duplicate write permanently suppressed for this dialog")
             return true
@@ -2049,7 +2096,7 @@ class UssdAccessibilityService : AccessibilityService() {
                 response = response,
                 responseKind = responseKind,
                 dialogText = dialogText,
-                signature = dialogSignature(root)
+                signature = initialSignature
             )
         }
 
@@ -2078,7 +2125,7 @@ class UssdAccessibilityService : AccessibilityService() {
         // Bound to THIS dialog: a pending runnable from an earlier step must never
         // retype its old value into a newer dialog (Somnet "wrong value first" bug).
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
-        val mySignature = dialogSignature(root)
+        val mySignature = initialSignature
         submitDialogSignature = mySignature
         scheduledStepOrder = step.order
         val scheduledSession = ussdSessionToken
@@ -2091,7 +2138,8 @@ class UssdAccessibilityService : AccessibilityService() {
                 // Stale-dialog guard: the screen already moved on — do nothing.
                 val liveSignature = dialogSignature(rt)
                 if (scheduledSession != ussdSessionToken ||
-                    mySignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != mySignature
+                    mySignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != mySignature &&
+                    !isSamePendingStepOnLiveDialog(extractDialogText(rt), step.order)
                 ) {
                     Log.w(TAG, "🚫 Stale submit dropped — dialog changed (was='${mySignature.take(24)}' now='${liveSignature.take(24)}')")
                     return@Runnable
@@ -2238,7 +2286,8 @@ class UssdAccessibilityService : AccessibilityService() {
             try {
                 val liveSignature = dialogSignature(rt)
                 if (scheduledSession != ussdSessionToken ||
-                    (signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) ||
+                    ((signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) &&
+                        !isSamePendingStepOnLiveDialog(extractDialogText(rt), step.order)) ||
                     step.order in completedFlowSteps
                 ) {
                     Log.w(TAG, "🚫 Input-field retry dropped — dialog or step changed")
