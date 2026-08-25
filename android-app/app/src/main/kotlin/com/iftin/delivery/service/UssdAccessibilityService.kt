@@ -1663,12 +1663,17 @@ class UssdAccessibilityService : AccessibilityService() {
             // A genuinely NEW dialog page invalidates any pending submit from the
             // previous page — otherwise its retype writes the old value here.
             if (lastDialogFingerprint.isNotBlank() && dialogFingerprint != lastDialogFingerprint && scheduledSubmitRunnable != null) {
-                scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
-                scheduledSubmitRunnable = null
-                awaitingScheduledSubmit = false
-                submitDialogSignature = ""
-        scheduledStepOrder = -1
-                Log.d(TAG, "🧹 New dialog page — dropped pending submit from previous page")
+                val samePendingStep = isSamePendingStepOnLiveDialog(eventDialogText, scheduledStepOrder)
+                if (samePendingStep) {
+                    Log.d(TAG, "⏳ Dialog signature changed while same step is still rendering — keeping pending submit/retry")
+                } else {
+                    scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+                    scheduledSubmitRunnable = null
+                    awaitingScheduledSubmit = false
+                    submitDialogSignature = ""
+                    scheduledStepOrder = -1
+                    Log.d(TAG, "🧹 New dialog page — dropped pending submit from previous page")
+                }
             }
             lastDialogFingerprint = dialogFingerprint
         }
