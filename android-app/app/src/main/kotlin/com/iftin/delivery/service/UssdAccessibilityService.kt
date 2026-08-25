@@ -249,6 +249,7 @@ class UssdAccessibilityService : AccessibilityService() {
     // A pending runnable must NEVER retype its old value into a NEW dialog — that is
     // what made Somnet type the previous step's value ("5516") into "Geli lacagta".
     @Volatile private var submitDialogSignature = ""
+    @Volatile private var scheduledStepOrder = -1
     @Volatile private var lastAttemptKey = ""
     @Volatile private var lastAttemptAtMs = 0L
 
@@ -439,6 +440,7 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledSubmitRunnable = null
         awaitingScheduledSubmit = false
         submitDialogSignature = ""
+        scheduledStepOrder = -1
         multiDialogRunnable?.let { handler.removeCallbacks(it) }
         multiDialogRunnable = null
         isProcessingDialog = false
@@ -462,6 +464,7 @@ class UssdAccessibilityService : AccessibilityService() {
         awaitingScheduledSubmit = true
         val pinSignature = dialogSignature(rootInActiveWindow)
         val scheduledSession = ussdSessionToken
+        scheduledStepOrder = source.substringAfter("flow-step-", "-1").substringBefore('-').toIntOrNull() ?: -1
         submitDialogSignature = pinSignature
         lateinit var rRef: Runnable
         val r = Runnable {
@@ -520,6 +523,7 @@ class UssdAccessibilityService : AccessibilityService() {
                 if (scheduledSubmitRunnable === rRef) {
                     scheduledSubmitRunnable = null
                     awaitingScheduledSubmit = false
+                    scheduledStepOrder = -1
                 }
             }
         }
@@ -1326,6 +1330,21 @@ class UssdAccessibilityService : AccessibilityService() {
         return step.keywords.any { keyword -> keyword.isNotBlank() && lower.contains(keyword.lowercase()) }
     }
 
+    private fun matchingPendingStep(dialogText: String): UssdFlowsClient.FlowStep? {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val flow = try {
+            UssdFlowsClient.findFlowById(prefs.getString("current_ussd_flow_id", null))
+                ?: UssdFlowsClient.findFlowForTrigger(prefs.getString("current_trigger_code", null))
+        } catch (_: Exception) { null } ?: return null
+        val pending = flow.steps.filter { it.order !in completedFlowSteps }
+        pending.firstOrNull { it.isPinField && dialogLooksLikePinPrompt(dialogText) }?.let { return it }
+        if (looksLikePackageMenu(dialogText)) {
+            pending.firstOrNull { flowResponseKind(it) == FlowResponseKind.MENU_CHOICE && flowStepMatchesContent(it, dialogText) }
+                ?.let { return it }
+        }
+        return pending.firstOrNull { flowStepMatchesContent(it, dialogText) }
+    }
+
     private fun flowResponseKind(step: UssdFlowsClient.FlowStep): FlowResponseKind {
         val template = step.responseTemplate.lowercase().trim()
         val literal = template.trim('{', '}')
@@ -1614,6 +1633,7 @@ class UssdAccessibilityService : AccessibilityService() {
                 scheduledSubmitRunnable = null
                 awaitingScheduledSubmit = false
                 submitDialogSignature = ""
+        scheduledStepOrder = -1
                 Log.d(TAG, "🧹 New dialog page — dropped pending submit from previous page")
             }
             lastDialogFingerprint = dialogFingerprint
