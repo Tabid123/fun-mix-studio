@@ -2024,7 +2024,8 @@ class UssdAccessibilityService : AccessibilityService() {
             Log.i(TAG, "USSD[step=${step.order}] MENU resolved choice='$response'")
         }
 
-        val attemptKey = "${step.order}:$response:${dialogSignature(root).take(80)}"
+        val initialSignature = dialogSignature(root)
+        val attemptKey = "${step.order}:$response:${initialSignature.take(80)}"
         if (attemptKey == lastAttemptKey) {
             Log.i(TAG, "USSD[step=${step.order}] duplicate write permanently suppressed for this dialog")
             return true
@@ -2092,7 +2093,7 @@ class UssdAccessibilityService : AccessibilityService() {
                 response = response,
                 responseKind = responseKind,
                 dialogText = dialogText,
-                signature = dialogSignature(root)
+                signature = initialSignature
             )
         }
 
@@ -2121,7 +2122,7 @@ class UssdAccessibilityService : AccessibilityService() {
         // Bound to THIS dialog: a pending runnable from an earlier step must never
         // retype its old value into a newer dialog (Somnet "wrong value first" bug).
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
-        val mySignature = dialogSignature(root)
+        val mySignature = initialSignature
         submitDialogSignature = mySignature
         scheduledStepOrder = step.order
         val scheduledSession = ussdSessionToken
@@ -2134,7 +2135,8 @@ class UssdAccessibilityService : AccessibilityService() {
                 // Stale-dialog guard: the screen already moved on — do nothing.
                 val liveSignature = dialogSignature(rt)
                 if (scheduledSession != ussdSessionToken ||
-                    mySignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != mySignature
+                    mySignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != mySignature &&
+                    !isSamePendingStepOnLiveDialog(extractDialogText(rt), step.order)
                 ) {
                     Log.w(TAG, "🚫 Stale submit dropped — dialog changed (was='${mySignature.take(24)}' now='${liveSignature.take(24)}')")
                     return@Runnable
