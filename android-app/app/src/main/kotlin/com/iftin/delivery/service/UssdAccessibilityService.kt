@@ -1971,7 +1971,10 @@ class UssdAccessibilityService : AccessibilityService() {
         // braces around literal values so they're typed as the value, not "{value}".
         response = response.replace(Regex("\\{([^{}]*)\\}"), "$1").trim()
         val responseKind = flowResponseKind(step)
-        if (responseKind == FlowResponseKind.MENU_CHOICE && isMenuList) {
+        // Admin-configured literal (e.g. "3") always wins — type exactly what the
+        // flow says. Keyword-based row resolution is only a fallback for when the
+        // template was left blank.
+        if (responseKind == FlowResponseKind.MENU_CHOICE && isMenuList && response.isBlank()) {
             response = resolveMenuChoice(dialogText, step.keywords, response)
             Log.i(TAG, "USSD[step=${step.order}] MENU resolved choice='$response'")
         }
