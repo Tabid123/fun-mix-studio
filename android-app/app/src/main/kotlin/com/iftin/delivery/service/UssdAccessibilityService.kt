@@ -2708,6 +2708,16 @@ class UssdAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun flowSessionHasPendingSteps(): Boolean {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(KEY_EXPECTING_USSD, false)) return false
+        val flow = try {
+            UssdFlowsClient.findFlowById(prefs.getString("current_ussd_flow_id", null))
+                ?: UssdFlowsClient.findFlowForTrigger(prefs.getString("current_trigger_code", null))
+        } catch (_: Exception) { null } ?: return false
+        return flow.steps.any { it.order !in completedFlowSteps }
+    }
+
     private fun shouldSuppressAutoClickForDialog(root: AccessibilityNodeInfo, dialogText: String?): Boolean {
         // A scheduled write -> verify -> send sequence owns this dialog. The generic
         // auto-click loop must stay out of the way until it has run, otherwise Send
@@ -2716,6 +2726,7 @@ class UssdAccessibilityService : AccessibilityService() {
             Log.i(TAG, "🛑 Suppressing auto-click — scheduled submit is pending")
             return true
         }
+
 
         // If this dialog matches a pending flow step, the dynamic flow handler owns
         // it. Never let the generic loop press Send — Somnet opens dialogs whose
@@ -2767,6 +2778,29 @@ class UssdAccessibilityService : AccessibilityService() {
         val hasEditableInput = inputState.first
         val hasEmptyEditableInput = inputState.second
         val hasFilledEditableInput = inputState.third
+
+        // 0. Somnet race: carrier dialogs can surface before their EditText (and
+        // sometimes even their text) reaches the accessibility tree — blank text,
+        // no visible field, yet Send is clickable. While a flow session still has
+        // unanswered steps, only the flow handler may submit a dialog that is (or
+        // is about to be) asking for input. The generic loop must stand down,
+        // otherwise Send fires empty and the carrier answers "Input required".
+        if (flowSessionHasPendingSteps() && !hasFilledEditableInput) {
+            val lowerDialog = dialogText?.lowercase().orEmpty()
+            val asksForInput = lowerDialog.isBlank() ||
+                dialogLooksLikeReceiverPrompt(lowerDialog) ||
+                dialogLooksLikeAmountPrompt(lowerDialog) ||
+                dialogLooksLikePinPrompt(lowerDialog) ||
+                looksLikeNumberedMenu(lowerDialog) ||
+                dialogLooksLikeMenuChoicePrompt(lowerDialog) ||
+                lowerDialog.contains("fadlan") ||
+                lowerDialog.contains("geli") ||
+                lowerDialog.contains("hubi")
+            if (asksForInput) {
+                Log.i(TAG, "🛑 Suppressing auto-click — flow session pending, dialog still needs input")
+                return true
+            }
+        }
 
         // 1. Before verified PIN auto-submit starts, keep the generic loop away from Send.
         if (pinFilledForSession && hasEditableInput && !pinSubmittedForSession) return true
