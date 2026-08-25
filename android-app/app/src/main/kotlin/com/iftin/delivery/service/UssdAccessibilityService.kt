@@ -102,6 +102,8 @@ class UssdAccessibilityService : AccessibilityService() {
         /** Set by UssdDialerService when a SILENT (TelephonyManager) reply was received. */
         const val KEY_SILENT_RESPONSE_AT = "silent_ussd_response_at"
         const val KEY_USSD_SESSION_ID = "ussd_session_id"  // Session ID to bind responses
+        private const val KEY_FLOW_STATE_SESSION = "flow_state_session"
+        private const val KEY_COMPLETED_FLOW_STEPS = "completed_flow_steps"
         // In-app diagnostics for PIN entry (visible without adb logcat)
         const val KEY_LAST_PIN_DEBUG = "last_pin_debug_snapshot"
         const val KEY_LAST_PIN_DEBUG_TIME = "last_pin_debug_time"
@@ -188,12 +190,13 @@ class UssdAccessibilityService : AccessibilityService() {
         
         // Timeout for expecting USSD flag (30 seconds - INCREASED from 15s)
         private const val EXPECTING_USSD_TIMEOUT_MS = 30000L
-        private const val DEBOUNCE_MS = 800L
+        private const val DEBOUNCE_MS = 400L
         // ===== UNIFIED TIMING (one behaviour for ALL providers) =====
         // Every step (PIN or non-PIN, Somtel/Somnet/Amtel/Hormuud) uses the SAME
         // write -> verify -> send delays. No provider-specific timing.
-        private const val SUBMIT_DELAY_MS = 2500L
-        private const val RECHECK_DELAY_MS = 1200L
+        private const val SUBMIT_DELAY_MS = 350L
+        private const val RECHECK_DELAY_MS = 900L
+        private const val ATTEMPT_DEBOUNCE_MS = 1200L
         // Legacy aliases kept so existing call sites stay readable.
         private const val CLICK_DELAY_MS = SUBMIT_DELAY_MS
         private const val NON_PIN_SUBMIT_DELAY_MS = SUBMIT_DELAY_MS
@@ -246,6 +249,8 @@ class UssdAccessibilityService : AccessibilityService() {
     // A pending runnable must NEVER retype its old value into a NEW dialog — that is
     // what made Somnet type the previous step's value ("5516") into "Geli lacagta".
     @Volatile private var submitDialogSignature = ""
+    @Volatile private var lastAttemptKey = ""
+    @Volatile private var lastAttemptAtMs = 0L
 
     // Delayed generic confirm runnable from onAccessibilityEvent.
     // Must be cancellable when a PIN dialog appears.
@@ -381,6 +386,10 @@ class UssdAccessibilityService : AccessibilityService() {
         lastIntendedPinForSession = ""
         pinRewriteAttempts = 0
         completedFlowSteps.clear()
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .remove(KEY_COMPLETED_FLOW_STEPS)
+            .remove(KEY_FLOW_STATE_SESSION)
+            .apply()
         cancelPendingAutoActions("session-reset:$reason")
         setTextSuppressUntilMs = 0L
         pinSetCount = 0
@@ -388,9 +397,39 @@ class UssdAccessibilityService : AccessibilityService() {
         ignoredEventCount = 0
         isProcessingDialog = false
         lastDialogFingerprint = ""
+        lastAttemptKey = ""
+        lastAttemptAtMs = 0L
         hudFirstReadLen = -1
         hudAttemptCount = 0
         Log.d(TAG, "♻️ Session state reset ($reason)")
+    }
+
+    private fun restoreOrStartSessionState(sessionToken: Long) {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedToken = prefs.getLong(KEY_FLOW_STATE_SESSION, 0L)
+        cancelPendingAutoActions("session-token-change")
+        if (savedToken == sessionToken) {
+            completedFlowSteps.clear()
+            prefs.getString(KEY_COMPLETED_FLOW_STEPS, "").orEmpty()
+                .split(',')
+                .mapNotNull { it.trim().toIntOrNull() }
+                .forEach(completedFlowSteps::add)
+            Log.i(TAG, "USSD session restored token=$sessionToken completed=$completedFlowSteps")
+        } else {
+            resetSessionState("new-session token=$sessionToken")
+            prefs.edit().putLong(KEY_FLOW_STATE_SESSION, sessionToken).apply()
+        }
+    }
+
+    private fun markFlowStepCompleted(stepOrder: Int) {
+        completedFlowSteps.add(stepOrder)
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putLong(KEY_FLOW_STATE_SESSION, ussdSessionToken)
+            .putString(KEY_COMPLETED_FLOW_STEPS, completedFlowSteps.sorted().joinToString(","))
+            .apply()
+        lastAttemptKey = ""
+        lastAttemptAtMs = 0L
+        Log.i(TAG, "USSD[step=$stepOrder] COMPLETED persisted=$completedFlowSteps")
     }
 
     private fun cancelPendingAutoActions(reason: String) {
