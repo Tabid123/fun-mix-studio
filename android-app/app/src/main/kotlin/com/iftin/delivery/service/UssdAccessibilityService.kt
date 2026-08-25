@@ -2779,6 +2779,29 @@ class UssdAccessibilityService : AccessibilityService() {
         val hasEmptyEditableInput = inputState.second
         val hasFilledEditableInput = inputState.third
 
+        // 0. Somnet race: carrier dialogs can surface before their EditText (and
+        // sometimes even their text) reaches the accessibility tree — blank text,
+        // no visible field, yet Send is clickable. While a flow session still has
+        // unanswered steps, only the flow handler may submit a dialog that is (or
+        // is about to be) asking for input. The generic loop must stand down,
+        // otherwise Send fires empty and the carrier answers "Input required".
+        if (flowSessionHasPendingSteps() && !hasFilledEditableInput) {
+            val lowerDialog = dialogText?.lowercase().orEmpty()
+            val asksForInput = lowerDialog.isBlank() ||
+                dialogLooksLikeReceiverPrompt(lowerDialog) ||
+                dialogLooksLikeAmountPrompt(lowerDialog) ||
+                dialogLooksLikePinPrompt(lowerDialog) ||
+                looksLikeNumberedMenu(lowerDialog) ||
+                dialogLooksLikeMenuChoicePrompt(lowerDialog) ||
+                lowerDialog.contains("fadlan") ||
+                lowerDialog.contains("geli") ||
+                lowerDialog.contains("hubi")
+            if (asksForInput) {
+                Log.i(TAG, "🛑 Suppressing auto-click — flow session pending, dialog still needs input")
+                return true
+            }
+        }
+
         // 1. Before verified PIN auto-submit starts, keep the generic loop away from Send.
         if (pinFilledForSession && hasEditableInput && !pinSubmittedForSession) return true
 
