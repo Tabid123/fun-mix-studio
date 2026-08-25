@@ -1404,9 +1404,14 @@ class UssdAccessibilityService : AccessibilityService() {
 
     private fun dialogLooksLikeReceiverPrompt(text: String?): Boolean {
         val lower = text.orEmpty().lowercase()
-        if (lower.isBlank() || looksLikeNumberedMenu(lower)) return false
+        if (lower.isBlank()) return false
         // "lambarka sirta" means secret/PIN number, not receiver phone.
         if (dialogLooksLikePinPrompt(lower)) return false
+        // Somnet's "Fadlan Hubi Mobilka" screen is still a receiver input step.
+        // Some devices expose extra numbered/action text in the same tree while the
+        // EditText is rendering; do NOT classify it as a menu or terminal dialog.
+        if (dialogLooksLikeReceiverConfirmationPrompt(lower)) return true
+        if (looksLikeNumberedMenu(lower)) return false
         return listOf(
             "geli mobil", "geli mobile", "mobilka", "mobile", "lambarka", "lambar",
             "number", "phone", "taleefan", "telefoon", "receiver", "reciver",
@@ -1416,19 +1421,28 @@ class UssdAccessibilityService : AccessibilityService() {
 
     private fun dialogLooksLikeReceiverConfirmationPrompt(text: String?): Boolean {
         val lower = text.orEmpty().lowercase()
-        if (lower.isBlank() || looksLikeNumberedMenu(lower)) return false
+        if (lower.isBlank()) return false
         if (dialogLooksLikePinPrompt(lower)) return false
-        return lower.contains("hubi mobil") ||
+        val receiverWord = lower.contains("mobil") ||
+            lower.contains("mobile") ||
+            lower.contains("lambar") ||
+            lower.contains("number") ||
+            lower.contains("taleefan") ||
+            lower.contains("telefoon")
+        return lower.contains("fadlan hubi mobil") ||
+            lower.contains("hubi mobil") ||
+            lower.contains("hubi mobile") ||
             lower.contains("confirm number") ||
             lower.contains("xaqiiji lambarka") ||
-            lower.contains("hubi lambarka")
+            lower.contains("hubi lambarka") ||
+            (lower.contains("hubi") && receiverWord)
     }
 
     private fun dialogLooksLikeMenuChoicePrompt(text: String?): Boolean {
         val lower = text.orEmpty().lowercase()
         if (lower.isBlank()) return false
-        if (looksLikeNumberedMenu(lower)) return true
         if (dialogLooksLikeAmountPrompt(lower) || dialogLooksLikeReceiverPrompt(lower) || dialogLooksLikePinPrompt(lower)) return false
+        if (looksLikeNumberedMenu(lower)) return true
         return listOf(
             "ma hubtaa", "mu hubtaa", "haa", "maya", "press 1", "riix 1",
             "accept", "ogolow", "door", "xulo", "select", "continue", "sii wad",
