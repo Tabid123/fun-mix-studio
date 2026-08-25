@@ -2507,6 +2507,44 @@ class UssdAccessibilityService : AccessibilityService() {
         return false
     }
 
+    private fun startTerminalResultWatcher() {
+        terminalWatcherRunnable?.let { handler.removeCallbacks(it) }
+        val session = ussdSessionToken
+        var attempts = 0
+        lateinit var watcher: Runnable
+        watcher = Runnable {
+            if (session != ussdSessionToken || attempts++ >= 6) {
+                if (terminalWatcherRunnable === watcher) terminalWatcherRunnable = null
+                return@Runnable
+            }
+            var handled = false
+            val roots = windows.mapNotNull { window -> try { window.root } catch (_: Exception) { null } }
+            try {
+                for (root in roots) {
+                    val text = extractDialogText(root).orEmpty()
+                    if (text.isBlank() || !isRealUssdDialog(root)) continue
+                    val pending = matchingPendingStep(text)
+                    if (pending == null && !looksLikeNumberedMenu(text) && isTerminalResultDialog(root)) {
+                        saveUssdResponse(text, isFinal = true)
+                        handled = clickTerminalDismissButton(root)
+                        Log.i(TAG, "USSD terminal watcher handled result dismissed=$handled")
+                        if (handled) break
+                    }
+                }
+            } finally {
+                roots.forEach { try { it.recycle() } catch (_: Exception) {} }
+            }
+            if (handled) {
+                resetSessionState("terminal-watcher")
+                terminalWatcherRunnable = null
+            } else {
+                handler.postDelayed(watcher, 1000L)
+            }
+        }
+        terminalWatcherRunnable = watcher
+        handler.postDelayed(watcher, 1000L)
+    }
+
     private fun saveUssdResponse(text: String, isFinal: Boolean = false) {
         // (see clickTerminalDismissButton below for terminal dialog handling)
         try {
