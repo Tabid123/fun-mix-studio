@@ -1369,6 +1369,11 @@ class UssdAccessibilityService : AccessibilityService() {
         return pending.firstOrNull { flowStepMatchesContent(it, dialogText) }
     }
 
+    private fun isSamePendingStepOnLiveDialog(dialogText: String?, stepOrder: Int): Boolean {
+        if (dialogText.isNullOrBlank() || stepOrder < 0) return false
+        return matchingPendingStep(dialogText)?.order == stepOrder
+    }
+
     private fun flowResponseKind(step: UssdFlowsClient.FlowStep): FlowResponseKind {
         val template = step.responseTemplate.lowercase().trim()
         val literal = template.trim('{', '}')
