@@ -102,6 +102,8 @@ class UssdAccessibilityService : AccessibilityService() {
         /** Set by UssdDialerService when a SILENT (TelephonyManager) reply was received. */
         const val KEY_SILENT_RESPONSE_AT = "silent_ussd_response_at"
         const val KEY_USSD_SESSION_ID = "ussd_session_id"  // Session ID to bind responses
+        private const val KEY_FLOW_STATE_SESSION = "flow_state_session"
+        private const val KEY_COMPLETED_FLOW_STEPS = "completed_flow_steps"
         // In-app diagnostics for PIN entry (visible without adb logcat)
         const val KEY_LAST_PIN_DEBUG = "last_pin_debug_snapshot"
         const val KEY_LAST_PIN_DEBUG_TIME = "last_pin_debug_time"
@@ -188,12 +190,13 @@ class UssdAccessibilityService : AccessibilityService() {
         
         // Timeout for expecting USSD flag (30 seconds - INCREASED from 15s)
         private const val EXPECTING_USSD_TIMEOUT_MS = 30000L
-        private const val DEBOUNCE_MS = 800L
+        private const val DEBOUNCE_MS = 400L
         // ===== UNIFIED TIMING (one behaviour for ALL providers) =====
         // Every step (PIN or non-PIN, Somtel/Somnet/Amtel/Hormuud) uses the SAME
         // write -> verify -> send delays. No provider-specific timing.
-        private const val SUBMIT_DELAY_MS = 2500L
-        private const val RECHECK_DELAY_MS = 1200L
+        private const val SUBMIT_DELAY_MS = 350L
+        private const val RECHECK_DELAY_MS = 900L
+        private const val ATTEMPT_DEBOUNCE_MS = 1200L
         // Legacy aliases kept so existing call sites stay readable.
         private const val CLICK_DELAY_MS = SUBMIT_DELAY_MS
         private const val NON_PIN_SUBMIT_DELAY_MS = SUBMIT_DELAY_MS
@@ -206,7 +209,7 @@ class UssdAccessibilityService : AccessibilityService() {
             "dialpad", "digits", "keypad", "dialButton", "one", "two", "three",
             "zero", "deleteButton", "searchview"
         )
-        private const val MAX_PIN_REWRITE_ATTEMPTS = 4
+        private const val MAX_PIN_REWRITE_ATTEMPTS = 1
         private const val MULTI_DIALOG_TIMEOUT_MS = 10000L
     }
     
@@ -215,6 +218,7 @@ class UssdAccessibilityService : AccessibilityService() {
     private var lastClickTime = 0L
     private var lastDialogFingerprint = ""
     private var multiDialogRunnable: Runnable? = null
+    private var terminalWatcherRunnable: Runnable? = null
 
     // Session guards to prevent duplicate PIN entry
     @Volatile private var ussdSessionToken = 0L
@@ -246,6 +250,9 @@ class UssdAccessibilityService : AccessibilityService() {
     // A pending runnable must NEVER retype its old value into a NEW dialog — that is
     // what made Somnet type the previous step's value ("5516") into "Geli lacagta".
     @Volatile private var submitDialogSignature = ""
+    @Volatile private var scheduledStepOrder = -1
+    @Volatile private var lastAttemptKey = ""
+    @Volatile private var lastAttemptAtMs = 0L
 
     // Delayed generic confirm runnable from onAccessibilityEvent.
     // Must be cancellable when a PIN dialog appears.
@@ -381,6 +388,10 @@ class UssdAccessibilityService : AccessibilityService() {
         lastIntendedPinForSession = ""
         pinRewriteAttempts = 0
         completedFlowSteps.clear()
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .remove(KEY_COMPLETED_FLOW_STEPS)
+            .remove(KEY_FLOW_STATE_SESSION)
+            .apply()
         cancelPendingAutoActions("session-reset:$reason")
         setTextSuppressUntilMs = 0L
         pinSetCount = 0
@@ -388,9 +399,39 @@ class UssdAccessibilityService : AccessibilityService() {
         ignoredEventCount = 0
         isProcessingDialog = false
         lastDialogFingerprint = ""
+        lastAttemptKey = ""
+        lastAttemptAtMs = 0L
         hudFirstReadLen = -1
         hudAttemptCount = 0
         Log.d(TAG, "♻️ Session state reset ($reason)")
+    }
+
+    private fun restoreOrStartSessionState(sessionToken: Long) {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedToken = prefs.getLong(KEY_FLOW_STATE_SESSION, 0L)
+        cancelPendingAutoActions("session-token-change")
+        if (savedToken == sessionToken) {
+            completedFlowSteps.clear()
+            prefs.getString(KEY_COMPLETED_FLOW_STEPS, "").orEmpty()
+                .split(',')
+                .mapNotNull { it.trim().toIntOrNull() }
+                .forEach(completedFlowSteps::add)
+            Log.i(TAG, "USSD session restored token=$sessionToken completed=$completedFlowSteps")
+        } else {
+            resetSessionState("new-session token=$sessionToken")
+            prefs.edit().putLong(KEY_FLOW_STATE_SESSION, sessionToken).apply()
+        }
+    }
+
+    private fun markFlowStepCompleted(stepOrder: Int) {
+        completedFlowSteps.add(stepOrder)
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putLong(KEY_FLOW_STATE_SESSION, ussdSessionToken)
+            .putString(KEY_COMPLETED_FLOW_STEPS, completedFlowSteps.sorted().joinToString(","))
+            .apply()
+        lastAttemptKey = ""
+        lastAttemptAtMs = 0L
+        Log.i(TAG, "USSD[step=$stepOrder] COMPLETED persisted=$completedFlowSteps")
     }
 
     private fun cancelPendingAutoActions(reason: String) {
@@ -400,8 +441,11 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledSubmitRunnable = null
         awaitingScheduledSubmit = false
         submitDialogSignature = ""
+        scheduledStepOrder = -1
         multiDialogRunnable?.let { handler.removeCallbacks(it) }
         multiDialogRunnable = null
+        terminalWatcherRunnable?.let { handler.removeCallbacks(it) }
+        terminalWatcherRunnable = null
         isProcessingDialog = false
         Log.d(TAG, "🛑 Cancelled pending auto-actions ($reason)")
     }
@@ -422,6 +466,8 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         awaitingScheduledSubmit = true
         val pinSignature = dialogSignature(rootInActiveWindow)
+        val scheduledSession = ussdSessionToken
+        scheduledStepOrder = source.substringAfter("flow-step-", "-1").substringBefore('-').toIntOrNull() ?: -1
         submitDialogSignature = pinSignature
         lateinit var rRef: Runnable
         val r = Runnable {
@@ -429,7 +475,9 @@ class UssdAccessibilityService : AccessibilityService() {
             try {
                 // Stale-dialog guard: never write/send into a dialog that already changed.
                 val liveSignature = dialogSignature(rt)
-                if (pinSignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != pinSignature) {
+                if (scheduledSession != ussdSessionToken ||
+                    pinSignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != pinSignature
+                ) {
                     Log.w(TAG, "🚫 submitPinOnce[$source] dropped — dialog changed")
                     return@Runnable
                 }
@@ -456,23 +504,8 @@ class UssdAccessibilityService : AccessibilityService() {
                             submitPinOnce(delayMs = 1200L, source = "$source-rewrite$pinRewriteAttempts")
                         }
                     } else {
-                        // FINAL FALLBACK (fixes "PIN entered but Send never pressed"):
-                        // after MAX rewrites, if the field visibly holds *something*
-                        // (masked bullets or any text), press Send instead of giving up.
-                        val filledLen = activeFieldFilledLength(rt)
-                        if (filledLen > 0) {
-                            Log.i(TAG, "USSD[$source] SEND fallback — field has data after $pinRewriteAttempts rewrites (len=$filledLen)")
-                            if (clickSendOrOkButton(rt, allowScheduledSubmit = true, source = source)) {
-                                pinSubmittedForSession = true
-                                submitCount++
-                                onSubmitted?.invoke()
-                            } else {
-                                Log.w(TAG, "USSD[$source] SEND failed — no Send/OK button clicked")
-                            }
-                        } else {
-                            pinWriteFailedForSession = true
-                            Log.e(TAG, "❌ submitPinOnce[$source] blocked after $pinRewriteAttempts rewrites — field is truly empty; Send will NOT be clicked")
-                        }
+                        pinWriteFailedForSession = true
+                        Log.e(TAG, "USSD[$source] VERIFY failed after one rewrite — Send blocked; next event may retry safely")
                     }
                     return@Runnable
                 }
@@ -482,6 +515,7 @@ class UssdAccessibilityService : AccessibilityService() {
                     pinSubmittedForSession = true
                     submitCount++
                     onSubmitted?.invoke()
+                                startTerminalResultWatcher()
                     Log.i(TAG, "✅ submitPinOnce[$source] auto-sent verified PIN (submitCount=$submitCount)")
                 } else {
                     Log.w(TAG, "USSD[$source] SEND failed — no Send/OK button clicked")
@@ -493,6 +527,7 @@ class UssdAccessibilityService : AccessibilityService() {
                 if (scheduledSubmitRunnable === rRef) {
                     scheduledSubmitRunnable = null
                     awaitingScheduledSubmit = false
+                    scheduledStepOrder = -1
                 }
             }
         }
@@ -1278,8 +1313,79 @@ class UssdAccessibilityService : AccessibilityService() {
         if (text.isBlank()) return false
         // Count occurrences of "1.", "2)", "1 -", or carrier variants like
         // "1 Haa". 2+ means it is a menu/choice list, not a value prompt.
-        val matches = Regex("(?m)(?:^|\\s)[1-9]\\s*[.)-]?\\s+\\S").findAll(text).count()
+        val flattened = text.replace(Regex("\\s+\\|\\s+"), "\n")
+        val matches = Regex("(?m)(?:^|\\s)[1-9]\\s*(?:[.)\\-:]\\s*|\\s+)\\S").findAll(flattened).count()
         return matches >= 2
+    }
+
+    private fun looksLikePackageMenu(text: String): Boolean {
+        if (!looksLikeNumberedMenu(text)) return false
+        val lower = text.lowercase()
+        return Regex("\\b\\d+\\s*(?:mb|gb)\\b").containsMatchIn(lower) ||
+            listOf("$", "saac", "unlimited", "bundle", "xirmo", "package").any(lower::contains)
+    }
+
+    private fun flowStepMatchesContent(step: UssdFlowsClient.FlowStep, dialogText: String): Boolean {
+        val lower = dialogText.lowercase()
+        if (!isFlowStepCompatibleWithDialog(step, dialogText)) return false
+        if (looksLikePackageMenu(dialogText) && step.order == 1 &&
+            step.keywords.any { it.equals("data", true) || it.equals("xogta", true) }
+        ) return false
+        return step.keywords.any { keyword -> keyword.isNotBlank() && lower.contains(keyword.lowercase()) }
+    }
+
+    private fun normalizeMenuLabel(value: String): String = value.lowercase()
+        .replace(Regex("^\\s*\\$?\\d+(?:[.,]\\d+)?\\s*=\\s*"), "")
+        .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+    private fun resolveMenuChoice(dialogText: String, keywords: List<String>, fallback: String): String {
+        val flattened = dialogText.replace(Regex("\\s+\\|\\s+"), "\n")
+        val rowRegex = Regex("(?m)^\\s*(\\d+)\\s*(?:[.)\\-:]\\s*|\\s+)(.+?)\\s*$")
+        val rows = rowRegex.findAll(flattened).map { it.groupValues[1] to normalizeMenuLabel(it.groupValues[2]) }.toMutableList()
+        if (rows.isEmpty()) {
+            val parts = dialogText.split(Regex("\\s+\\|\\s+")).map(String::trim).filter(String::isNotBlank)
+            for (i in 0 until parts.lastIndex) {
+                val number = parts[i].trim().trimEnd('.', ')', '-', ':')
+                if (number.all(Char::isDigit) && number.isNotEmpty()) {
+                    rows.add(number to normalizeMenuLabel(parts[i + 1]))
+                }
+            }
+        }
+        if (rows.isEmpty()) return fallback
+        val groups = keywords.flatMap { it.split(';') }
+            .map(::normalizeMenuLabel)
+            .filter { it.isNotBlank() && it !in setOf("menu", "xulo", "dooro", "select") }
+        for (group in groups) {
+            val tokens = group.split(' ').filter(String::isNotBlank)
+            val exact = rows.firstOrNull { (_, label) -> label == group }
+            if (exact != null) return exact.first
+            val allTokens = rows.firstOrNull { (_, label) -> tokens.isNotEmpty() && tokens.all { token ->
+                Regex("(?<![\\w.])${Regex.escape(token)}(?![\\w.])").containsMatchIn(label)
+            } }
+            if (allTokens != null) return allTokens.first
+            if (tokens.size >= 3) {
+                val fuzzy = rows.firstOrNull { (_, label) -> tokens.count { label.contains(it) } >= tokens.size - 1 }
+                if (fuzzy != null) return fuzzy.first
+            }
+        }
+        return fallback.ifBlank { "1" }
+    }
+
+    private fun matchingPendingStep(dialogText: String): UssdFlowsClient.FlowStep? {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val flow = try {
+            UssdFlowsClient.findFlowById(prefs.getString("current_ussd_flow_id", null))
+                ?: UssdFlowsClient.findFlowForTrigger(prefs.getString("current_trigger_code", null))
+        } catch (_: Exception) { null } ?: return null
+        val pending = flow.steps.filter { it.order !in completedFlowSteps }
+        pending.firstOrNull { it.isPinField && dialogLooksLikePinPrompt(dialogText) }?.let { return it }
+        if (looksLikePackageMenu(dialogText)) {
+            pending.firstOrNull { flowResponseKind(it) == FlowResponseKind.MENU_CHOICE && flowStepMatchesContent(it, dialogText) }
+                ?.let { return it }
+        }
+        return pending.firstOrNull { flowStepMatchesContent(it, dialogText) }
     }
 
     private fun flowResponseKind(step: UssdFlowsClient.FlowStep): FlowResponseKind {
@@ -1446,7 +1552,8 @@ class UssdAccessibilityService : AccessibilityService() {
             // instead of opening a brand-new window, so receiver/amount prompts only
             // arrive as content changes.
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
-                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                AccessibilityEvent.TYPE_WINDOWS_CHANGED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
@@ -1482,7 +1589,7 @@ class UssdAccessibilityService : AccessibilityService() {
         // New USSD session started: reset one-time PIN guards
         if (expectingUssd && lastUssdTime != 0L && lastUssdTime != ussdSessionToken) {
             ussdSessionToken = lastUssdTime
-            resetSessionState("new-session token=$ussdSessionToken")
+            restoreOrStartSessionState(ussdSessionToken)
             Log.d(TAG, "🆕 New USSD session detected token=$ussdSessionToken")
         }
 
@@ -1500,7 +1607,8 @@ class UssdAccessibilityService : AccessibilityService() {
         // ===== HARDENED EVENT FILTERING =====
         // 1. Process only USSD dialog transitions we care about.
         val isRelevantEvent = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-            event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+            event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED
         if (!isRelevantEvent) {
             ignoredEventCount++
             if (ignoredEventCount % 10 == 1) {
@@ -1568,6 +1676,7 @@ class UssdAccessibilityService : AccessibilityService() {
                 scheduledSubmitRunnable = null
                 awaitingScheduledSubmit = false
                 submitDialogSignature = ""
+        scheduledStepOrder = -1
                 Log.d(TAG, "🧹 New dialog page — dropped pending submit from previous page")
             }
             lastDialogFingerprint = dialogFingerprint
@@ -1643,7 +1752,8 @@ class UssdAccessibilityService : AccessibilityService() {
             // session ends cleanly (no lingering dialog, no stale intermediate text).
             val isUnansweredChoiceDialog = !dialogText.isNullOrBlank() &&
                 (looksLikeNumberedMenu(dialogText) || hasUnansweredChoiceStep(dialogText))
-            if (isTerminalResultDialog(source) && !isUnansweredChoiceDialog) {
+                val pendingContentStep = dialogText?.let(::matchingPendingStep)
+                if (isTerminalResultDialog(source) && !isUnansweredChoiceDialog && pendingContentStep == null) {
                 if (!dialogText.isNullOrBlank()) {
                     saveUssdResponse(dialogText, isFinal = true)
                 }
@@ -1794,7 +1904,7 @@ class UssdAccessibilityService : AccessibilityService() {
 
         if (awaitingScheduledSubmit && submitDialogSignature.isNotBlank()) {
             val currentSignature = dialogSignature(root)
-            if (currentSignature.isNotBlank() && currentSignature == submitDialogSignature) {
+            if (currentSignature.isNotBlank() && currentSignature == submitDialogSignature && scheduledStepOrder >= 0) {
                 Log.i(TAG, "USSD[pending] WRITE skipped — this dialog already has a scheduled submit")
                 return true
             }
@@ -1824,50 +1934,21 @@ class UssdAccessibilityService : AccessibilityService() {
         }
         val looksLikePinDialog = dialogLooksLikePinPrompt(dialogText)
         val unansweredSteps = flow.steps.filter { it.order !in completedFlowSteps }
-        val expectedNextOrder = (completedFlowSteps.maxOrNull() ?: 0) + 1
-        val keywordMatches = unansweredSteps.filter { s ->
-            s.order !in completedFlowSteps &&
-            s.keywords.isNotEmpty() &&
-            s.keywords.any { kw -> lower.contains(kw.lowercase()) }
-        }
-        val compatibleKeywordMatches = keywordMatches.filter { s -> isFlowStepCompatibleWithDialog(s, dialogText) }
-        if (keywordMatches.isNotEmpty() && compatibleKeywordMatches.isEmpty()) {
-            Log.w(
-                TAG,
-                "🛡️ Flow ${flow.triggerCode}: keyword match rejected by value-type guard. " +
-                    "matches=${keywordMatches.map { it.order }} dialog=${dialogText.take(120)}"
-            )
-        }
-        val expectedStep = flow.steps.firstOrNull { it.order == expectedNextOrder }
-        // Never jump to a later response merely because its broad keyword appears in
-        // carrier boilerplate. Only the exact next step may answer this dialog.
-        val matchedStep = compatibleKeywordMatches.firstOrNull { it.order == expectedNextOrder }
-        val step = matchedStep ?: expectedStep?.takeIf { s ->
-                !s.isPinField &&
-                completedFlowSteps.isNotEmpty() &&
-                !looksLikePinDialog &&
-                isFlowStepCompatibleWithDialog(s, dialogText) &&
-                // A confirmation menu ("1. Haa / 2. Maya") sometimes exposes no
-                // EditText to Accessibility; still allow the numeric answer there.
-                (hasVisibleEditableInput(root) || isMenuList) &&
-                // Numbered menus (incl. the final "1. Haa / 2. Maya" confirmation)
-                // may be auto-answered ONLY when the pending step is a short menu
-                // selection like "1" or "2" — never free text such as a phone number.
-                (!isMenuList || s.responseTemplate.trim().trim('{', '}').let { t ->
-                    t.isNotEmpty() && t.length <= 2 && t.all(Char::isDigit)
-                })
-        }?.also { fallbackStep ->
-            Log.w(
-                TAG,
-                "🧭 Flow ${flow.triggerCode}: no keyword matched for dialog; using sequential fallback step #${fallbackStep.order}. completed=$completedFlowSteps dialog=${dialogText.take(120)}"
-            )
-        }
+        // Content decides the step. PIN wins, then package menus, then compatible
+        // keyword matches. There is deliberately no order/timing fallback.
+        val step = unansweredSteps.firstOrNull { it.isPinField && looksLikePinDialog } ?: run {
+            if (looksLikePackageMenu(dialogText)) {
+                unansweredSteps.firstOrNull {
+                    flowResponseKind(it) == FlowResponseKind.MENU_CHOICE && flowStepMatchesContent(it, dialogText)
+                }
+            } else null
+        } ?: unansweredSteps.firstOrNull { flowStepMatchesContent(it, dialogText) }
         if (step == null) {
             Log.d(TAG, "ℹ️ Flow ${flow.triggerCode}: no step matched. completed=$completedFlowSteps dialog=${dialogText.take(120)}")
             // Self-healing: log this unmatched dialog so admin can teach the system.
             try {
                 val deviceId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
-                val nextOrder = (completedFlowSteps.maxOrNull() ?: 0) + 1
+                val nextOrder = unansweredSteps.minOfOrNull { it.order } ?: 1
                 UssdFlowsClient.logUnmatchedAsync(flow.id, nextOrder, dialogText, deviceId)
             } catch (_: Exception) {}
             return false
@@ -1887,7 +1968,7 @@ class UssdAccessibilityService : AccessibilityService() {
         // Prevents Somnet "Invalid PIN format" loops where the carrier re-prompts.
         if (step.isPinField && pinFilledForSession) {
             if (pinSubmittedForSession) {
-                completedFlowSteps.add(step.order)
+                markFlowStepCompleted(step.order)
                 Log.d(TAG, "⏭️ Flow PIN step #${step.order} already submitted this session; marking complete")
             } else {
                 Log.d(TAG, "⏭️ Flow PIN step #${step.order} already filled and awaiting scheduled submit")
@@ -1921,6 +2002,20 @@ class UssdAccessibilityService : AccessibilityService() {
         // Tolerate admin entries like "{5516}", "{2}", "{1}" — strip remaining
         // braces around literal values so they're typed as the value, not "{value}".
         response = response.replace(Regex("\\{([^{}]*)\\}"), "$1").trim()
+        val responseKind = flowResponseKind(step)
+        if (responseKind == FlowResponseKind.MENU_CHOICE && isMenuList) {
+            response = resolveMenuChoice(dialogText, step.keywords, response)
+            Log.i(TAG, "USSD[step=${step.order}] MENU resolved choice='$response'")
+        }
+
+        val attemptKey = "${step.order}:$response:${dialogSignature(root).take(80)}"
+        val attemptNow = System.currentTimeMillis()
+        if (attemptKey == lastAttemptKey && attemptNow - lastAttemptAtMs < ATTEMPT_DEBOUNCE_MS) {
+            Log.i(TAG, "USSD[step=${step.order}] duplicate attempt suppressed")
+            return true
+        }
+        lastAttemptKey = attemptKey
+        lastAttemptAtMs = attemptNow
 
         if (response.isBlank()) {
             Log.w(TAG, "⚠️ Flow step #${step.order} matched but response is empty")
@@ -1953,7 +2048,7 @@ class UssdAccessibilityService : AccessibilityService() {
             submitPinOnce(
                 delayMs = SUBMIT_DELAY_MS,
                 source = "flow-step-${step.order}",
-                onSubmitted = { completedFlowSteps.add(step.order) }
+                onSubmitted = { markFlowStepCompleted(step.order) }
             )
 
             return true
@@ -1983,8 +2078,6 @@ class UssdAccessibilityService : AccessibilityService() {
             Log.w(TAG, "⚠️ Failed to type flow response into EditText")
             return false
         }
-        val responseKind = flowResponseKind(step)
-
         // Keep a short marker for potential SET_TEXT echo events only.
         // onAccessibilityEvent no longer suppresses TYPE_WINDOW_STATE_CHANGED using this,
         // so the next USSD screen can still be processed immediately.
@@ -2006,6 +2099,8 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         val mySignature = dialogSignature(root)
         submitDialogSignature = mySignature
+        scheduledStepOrder = step.order
+        val scheduledSession = ussdSessionToken
         var submitAttempt = 0
         lateinit var submitRunnable: Runnable
         awaitingScheduledSubmit = true
@@ -2015,13 +2110,14 @@ class UssdAccessibilityService : AccessibilityService() {
             try {
                 // Stale-dialog guard: the screen already moved on — do nothing.
                 val liveSignature = dialogSignature(rt)
-                if (mySignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != mySignature) {
+                if (scheduledSession != ussdSessionToken ||
+                    mySignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != mySignature
+                ) {
                     Log.w(TAG, "🚫 Stale submit dropped — dialog changed (was='${mySignature.take(24)}' now='${liveSignature.take(24)}')")
                     return@Runnable
                 }
-                val expectedOrderNow = (completedFlowSteps.maxOrNull() ?: 0) + 1
-                if (expectedOrderNow != step.order) {
-                    Log.w(TAG, "🚫 Stale submit dropped — flow advanced to step $expectedOrderNow (scheduled=${step.order})")
+                if (step.order in completedFlowSteps) {
+                    Log.w(TAG, "🚫 Stale submit dropped — step ${step.order} already completed")
                     return@Runnable
                 }
                 // Never press Send while the dialog input is still empty — carriers
@@ -2030,37 +2126,35 @@ class UssdAccessibilityService : AccessibilityService() {
                 Log.i(TAG, "USSD[step=${step.order}] VERIFY ${if (verified) "ok" else "retry"} value='$response'")
                 if (!verified) {
                     submitAttempt++
-                    if (submitAttempt <= 4) {
+                    if (submitAttempt <= 1) {
                         Log.w(TAG, "⏳ Field not committed yet (attempt $submitAttempt) — retyping '$response' and waiting")
                         typeIntoActiveEditableField(rt, response)
                         handler.postDelayed(submitRunnable, RECHECK_DELAY_MS)
                         rescheduled = true
                         return@Runnable
                     }
-                    // Never stall the order: after the retries, press Send as long as
-                    // the field visibly holds data; if it reads empty, write once more
-                    // and still press Send (unreadable fields must not block the flow).
-                    val filledLen = activeFieldFilledLength(rt)
-                    if (filledLen <= 0) {
-                        Log.w(TAG, "⚠️ Field reads empty after $submitAttempt attempts — final write then Send anyway")
-                        typeIntoActiveEditableField(rt, response)
-                        if (!isStepValueCommitted(rt, response, responseKind) && !canTrustFilledButUnverifiedStep(rt, response, responseKind)) {
-                            Log.e(TAG, "🛑 USSD[step=${step.order}] SEND blocked — final write did not commit safe ${responseKind.name} value '$response'")
-                            return@Runnable
-                        }
-                    } else if (!canTrustFilledButUnverifiedStep(rt, response, responseKind)) {
-                        Log.e(TAG, "🛑 USSD[step=${step.order}] SEND blocked — unverified ${responseKind.name} value would be unsafe (expected='$response' len=$filledLen)")
-                        return@Runnable
-                    } else {
-                        Log.i(TAG, "✅ Sending after $submitAttempt attempts — field has data (len=$filledLen)")
+                    Log.e(TAG, "🛑 USSD[step=${step.order}] VERIFY failed after one rewrite — Send blocked")
+                    return@Runnable
+                }
+                var sendClicked = clickSendOrOkButton(rt, allowScheduledSubmit = true, source = "flow-step-${step.order}") ||
+                    (responseKind == FlowResponseKind.MENU_CHOICE && clickNumberedMenuOption(rt, response))
+                if (!sendClicked) {
+                    SystemClock.sleep(RECHECK_DELAY_MS)
+                    val retryRoot = rootInActiveWindow
+                    if (retryRoot != null) {
+                        try {
+                            if (dialogSignature(retryRoot) == mySignature && isStepValueCommitted(retryRoot, response, responseKind)) {
+                                sendClicked = clickSendOrOkButton(retryRoot, allowScheduledSubmit = true, source = "flow-step-${step.order}-send-retry") ||
+                                    (responseKind == FlowResponseKind.MENU_CHOICE && clickNumberedMenuOption(retryRoot, response))
+                            }
+                        } finally { retryRoot.recycle() }
                     }
                 }
-                val sendClicked = clickSendOrOkButton(rt, allowScheduledSubmit = true, source = "flow-step-${step.order}") ||
-                    (responseKind == FlowResponseKind.MENU_CHOICE && clickNumberedMenuOption(rt, response))
                 if (sendClicked) {
-                    completedFlowSteps.add(step.order)
+                    markFlowStepCompleted(step.order)
                     submitCount++
                     Log.i(TAG, "USSD[step=${step.order}] SEND clicked submitCount=$submitCount")
+                    if (responseKind == FlowResponseKind.PIN) startTerminalResultWatcher()
                 } else {
                     Log.w(TAG, "USSD[step=${step.order}] SEND failed — no Send/OK button clicked")
                 }
@@ -2068,6 +2162,7 @@ class UssdAccessibilityService : AccessibilityService() {
                 if (!rescheduled && scheduledSubmitRunnable === submitRunnable) {
                     awaitingScheduledSubmit = false
                     scheduledSubmitRunnable = null
+                    scheduledStepOrder = -1
                 }
                 try { rt.recycle() } catch (_: Exception) {}
             }
@@ -2093,6 +2188,8 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         val signature = dialogSignature(rootInActiveWindow)
         submitDialogSignature = signature
+        scheduledStepOrder = stepOrder
+        val scheduledSession = ussdSessionToken
         awaitingScheduledSubmit = true
         var attempt = 0
         lateinit var runnable: Runnable
@@ -2101,15 +2198,15 @@ class UssdAccessibilityService : AccessibilityService() {
             var rescheduled = false
             try {
                 val liveSignature = dialogSignature(rt)
-                val expectedOrderNow = (completedFlowSteps.maxOrNull() ?: 0) + 1
-                if ((signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) ||
-                    expectedOrderNow != stepOrder
+                if (scheduledSession != ussdSessionToken ||
+                    (signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) ||
+                    stepOrder in completedFlowSteps
                 ) {
                     Log.w(TAG, "🚫 Numbered-menu click dropped — dialog or step changed")
                     return@Runnable
                 }
                 if (clickNumberedMenuOption(rt, response)) {
-                    completedFlowSteps.add(stepOrder)
+                    markFlowStepCompleted(stepOrder)
                     submitCount++
                     reportFlowProgress(
                         stepOrder = stepOrder,
@@ -2133,6 +2230,7 @@ class UssdAccessibilityService : AccessibilityService() {
                     scheduledSubmitRunnable = null
                     awaitingScheduledSubmit = false
                     submitDialogSignature = ""
+                    scheduledStepOrder = -1
                 }
                 try { rt.recycle() } catch (_: Exception) {}
             }
@@ -2407,6 +2505,44 @@ class UssdAccessibilityService : AccessibilityService() {
             }
         }
         return false
+    }
+
+    private fun startTerminalResultWatcher() {
+        terminalWatcherRunnable?.let { handler.removeCallbacks(it) }
+        val session = ussdSessionToken
+        var attempts = 0
+        lateinit var watcher: Runnable
+        watcher = Runnable {
+            if (session != ussdSessionToken || attempts++ >= 6) {
+                if (terminalWatcherRunnable === watcher) terminalWatcherRunnable = null
+                return@Runnable
+            }
+            var handled = false
+            val roots = windows.mapNotNull { window -> try { window.root } catch (_: Exception) { null } }
+            try {
+                for (root in roots) {
+                    val text = extractDialogText(root).orEmpty()
+                    if (text.isBlank() || !isRealUssdDialog(root)) continue
+                    val pending = matchingPendingStep(text)
+                    if (pending == null && !looksLikeNumberedMenu(text) && isTerminalResultDialog(root)) {
+                        saveUssdResponse(text, isFinal = true)
+                        handled = clickTerminalDismissButton(root)
+                        Log.i(TAG, "USSD terminal watcher handled result dismissed=$handled")
+                        if (handled) break
+                    }
+                }
+            } finally {
+                roots.forEach { try { it.recycle() } catch (_: Exception) {} }
+            }
+            if (handled) {
+                resetSessionState("terminal-watcher")
+                terminalWatcherRunnable = null
+            } else {
+                handler.postDelayed(watcher, 1000L)
+            }
+        }
+        terminalWatcherRunnable = watcher
+        handler.postDelayed(watcher, 1000L)
     }
 
     private fun saveUssdResponse(text: String, isFinal: Boolean = false) {
