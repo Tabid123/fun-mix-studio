@@ -2283,7 +2283,8 @@ class UssdAccessibilityService : AccessibilityService() {
             try {
                 val liveSignature = dialogSignature(rt)
                 if (scheduledSession != ussdSessionToken ||
-                    (signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) ||
+                    ((signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) &&
+                        !isSamePendingStepOnLiveDialog(extractDialogText(rt), step.order)) ||
                     step.order in completedFlowSteps
                 ) {
                     Log.w(TAG, "🚫 Input-field retry dropped — dialog or step changed")
