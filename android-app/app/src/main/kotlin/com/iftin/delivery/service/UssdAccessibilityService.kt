@@ -2212,6 +2212,9 @@ class UssdAccessibilityService : AccessibilityService() {
                         rescheduled = true
                     } else {
                         Log.e(TAG, "🛑 USSD[step=${step.order}] VERIFY failed — Send blocked; value will not be cleared or rewritten")
+                        if (responseKind == FlowResponseKind.RECEIVER) {
+                            scheduleReceiverWriteRetry(step, flow.steps.size, response, liveDialogText.orEmpty(), liveSignature.ifBlank { mySignature })
+                        }
                     }
                     return@Runnable
                 }
