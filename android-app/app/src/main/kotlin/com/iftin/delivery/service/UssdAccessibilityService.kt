@@ -218,6 +218,7 @@ class UssdAccessibilityService : AccessibilityService() {
     private var lastClickTime = 0L
     private var lastDialogFingerprint = ""
     private var multiDialogRunnable: Runnable? = null
+    private var terminalWatcherRunnable: Runnable? = null
 
     // Session guards to prevent duplicate PIN entry
     @Volatile private var ussdSessionToken = 0L
@@ -443,6 +444,8 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledStepOrder = -1
         multiDialogRunnable?.let { handler.removeCallbacks(it) }
         multiDialogRunnable = null
+        terminalWatcherRunnable?.let { handler.removeCallbacks(it) }
+        terminalWatcherRunnable = null
         isProcessingDialog = false
         Log.d(TAG, "🛑 Cancelled pending auto-actions ($reason)")
     }
@@ -512,6 +515,7 @@ class UssdAccessibilityService : AccessibilityService() {
                     pinSubmittedForSession = true
                     submitCount++
                     onSubmitted?.invoke()
+                                startTerminalResultWatcher()
                     Log.i(TAG, "✅ submitPinOnce[$source] auto-sent verified PIN (submitCount=$submitCount)")
                 } else {
                     Log.w(TAG, "USSD[$source] SEND failed — no Send/OK button clicked")
@@ -1339,7 +1343,16 @@ class UssdAccessibilityService : AccessibilityService() {
     private fun resolveMenuChoice(dialogText: String, keywords: List<String>, fallback: String): String {
         val flattened = dialogText.replace(Regex("\\s+\\|\\s+"), "\n")
         val rowRegex = Regex("(?m)^\\s*(\\d+)\\s*(?:[.)\\-:]\\s*|\\s+)(.+?)\\s*$")
-        val rows = rowRegex.findAll(flattened).map { it.groupValues[1] to normalizeMenuLabel(it.groupValues[2]) }.toList()
+        val rows = rowRegex.findAll(flattened).map { it.groupValues[1] to normalizeMenuLabel(it.groupValues[2]) }.toMutableList()
+        if (rows.isEmpty()) {
+            val parts = dialogText.split(Regex("\\s+\\|\\s+")).map(String::trim).filter(String::isNotBlank)
+            for (i in 0 until parts.lastIndex) {
+                val number = parts[i].trim().trimEnd('.', ')', '-', ':')
+                if (number.all(Char::isDigit) && number.isNotEmpty()) {
+                    rows.add(number to normalizeMenuLabel(parts[i + 1]))
+                }
+            }
+        }
         if (rows.isEmpty()) return fallback
         val groups = keywords.flatMap { it.split(';') }
             .map(::normalizeMenuLabel)
@@ -1739,7 +1752,8 @@ class UssdAccessibilityService : AccessibilityService() {
             // session ends cleanly (no lingering dialog, no stale intermediate text).
             val isUnansweredChoiceDialog = !dialogText.isNullOrBlank() &&
                 (looksLikeNumberedMenu(dialogText) || hasUnansweredChoiceStep(dialogText))
-            if (isTerminalResultDialog(source) && !isUnansweredChoiceDialog) {
+                val pendingContentStep = dialogText?.let(::matchingPendingStep)
+                if (isTerminalResultDialog(source) && !isUnansweredChoiceDialog && pendingContentStep == null) {
                 if (!dialogText.isNullOrBlank()) {
                     saveUssdResponse(dialogText, isFinal = true)
                 }
@@ -2140,6 +2154,7 @@ class UssdAccessibilityService : AccessibilityService() {
                     markFlowStepCompleted(step.order)
                     submitCount++
                     Log.i(TAG, "USSD[step=${step.order}] SEND clicked submitCount=$submitCount")
+                    if (responseKind == FlowResponseKind.PIN) startTerminalResultWatcher()
                 } else {
                     Log.w(TAG, "USSD[step=${step.order}] SEND failed — no Send/OK button clicked")
                 }
@@ -2183,7 +2198,6 @@ class UssdAccessibilityService : AccessibilityService() {
             var rescheduled = false
             try {
                 val liveSignature = dialogSignature(rt)
-                val expectedOrderNow = (completedFlowSteps.maxOrNull() ?: 0) + 1
                 if (scheduledSession != ussdSessionToken ||
                     (signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) ||
                     stepOrder in completedFlowSteps
