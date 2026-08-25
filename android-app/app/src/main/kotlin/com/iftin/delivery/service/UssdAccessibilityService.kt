@@ -209,7 +209,7 @@ class UssdAccessibilityService : AccessibilityService() {
             "dialpad", "digits", "keypad", "dialButton", "one", "two", "three",
             "zero", "deleteButton", "searchview"
         )
-        private const val MAX_PIN_REWRITE_ATTEMPTS = 1
+        private const val MAX_PIN_REWRITE_ATTEMPTS = 0
         private const val MULTI_DIALOG_TIMEOUT_MS = 10000L
     }
     
@@ -493,20 +493,8 @@ class UssdAccessibilityService : AccessibilityService() {
                 val live = readActivePinFieldText(rt)
                 val committed = isPinCommittedInActiveField(rt, expected)
                 if (expected.isNotBlank() && !committed) {
-                    Log.w(TAG, "🔁 submitPinOnce[$source] field not committed (live='${live.length} chars' expected len=${expected.length}) — rewriting PIN")
-                    if (pinRewriteAttempts < MAX_PIN_REWRITE_ATTEMPTS) {
-                        pinRewriteAttempts++
-                        pinFilledForSession = false
-                        pinVerifiedForSession = false
-                        pinWriteFailedForSession = false
-                        pinSetCount = 0
-                        if (safeEnterPin(rt, expected)) {
-                            submitPinOnce(delayMs = 1200L, source = "$source-rewrite$pinRewriteAttempts")
-                        }
-                    } else {
-                        pinWriteFailedForSession = true
-                        Log.e(TAG, "USSD[$source] VERIFY failed after one rewrite — Send blocked; next event may retry safely")
-                    }
+                    pinWriteFailedForSession = true
+                    Log.e(TAG, "USSD[$source] VERIFY failed — Send blocked; value will not be cleared or rewritten")
                     return@Runnable
                 }
 
@@ -737,19 +725,13 @@ class UssdAccessibilityService : AccessibilityService() {
         val hasRealEditableField = candidates.any { it.isVisible && it.isEnabled && it.isEditable }
         val methods = mutableListOf<Pair<String, (AccessibilityNodeInfo, String) -> Boolean>>()
         if (hasRealEditableField) {
-            // UNIFIED WRITE PATH — identical for every provider (no somnet/somtel branch).
-            // PASTE fires the same input/commit path as user typing; SET_TEXT is the
-            // fallback; the visible IME keypad is the LAST resort only when both fail.
-            methods += "clipboard_paste" to { node: AccessibilityNodeInfo, pin: String ->
-                writeWithClipboardPaste(node, pin, requireFocus = true)
-            }
-            methods += "action_set_text" to { node: AccessibilityNodeInfo, pin: String ->
+            // One atomic write only. Never clear, paste, rewrite, or inject keyboard
+            // gestures into the same dialog; those fallbacks visibly replaced the
+            // correct value with later values on Somnet/Somtel/Amtel.
+            methods += "single_action_set_text" to { node: AccessibilityNodeInfo, pin: String ->
                 writeWithActionSetText(node, pin)
             }
-            methods += "visible_ime_keypad" to { node: AccessibilityNodeInfo, pin: String ->
-                writeWithVisibleImeKeypad(node, pin)
-            }
-            Log.d(TAG, "🧭 PIN path = ${methods.joinToString(" → ") { it.first }} (EditText present, package=$activePackage)")
+            Log.d(TAG, "🧭 PIN path = single ACTION_SET_TEXT (EditText present, package=$activePackage)")
         } else {
 
             pinWriteFailedForSession = true
@@ -761,13 +743,8 @@ class UssdAccessibilityService : AccessibilityService() {
         var ok = false
         try {
             for ((methodName, writer) in methods) {
-                if (methodName == "action_set_text" || methodName == "clipboard_paste" || methodName == "visible_ime_keypad") {
-                    val existing = preferred.node.text?.toString().orEmpty()
-                    if (existing.isNotEmpty() && existing != cleanPin) {
-                        clearEditableField(preferred.node)
-                    } else {
-                        focusEditableField(preferred.node, requireAccessibilityFocus = true)
-                    }
+                if (methodName == "single_action_set_text") {
+                    focusEditableField(preferred.node, requireAccessibilityFocus = true)
                 } else {
                     Log.w(TAG, "⚠️ Unexpected PIN writer '$methodName' skipped")
                     continue
@@ -934,17 +911,6 @@ class UssdAccessibilityService : AccessibilityService() {
         focusEditableField(node)
         // Trim any hidden whitespace/newlines from the PIN before insertion.
         val safePin = pin.trim()
-        // Samsung-friendly "dirty-loop": first set to empty (forces beforeTextChanged),
-        // then set to the PIN (forces onTextChanged + afterTextChanged), then move
-        // the cursor to the end. Without the empty pre-step, Samsung's numberPassword
-        // EditText accepts ACTION_SET_TEXT but never fires the TextWatcher/KeyListener,
-        // so the carrier receives an empty value → "Invalid PIN format".
-        val emptyArgs = android.os.Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
-        }
-        val clearedOk = try { node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, emptyArgs) } catch (_: Exception) { false }
-        try { SystemClock.sleep(40L) } catch (_: Exception) {}
-
         val args = android.os.Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, safePin)
         }
@@ -964,7 +930,7 @@ class UssdAccessibilityService : AccessibilityService() {
             node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selArgs)
         } catch (_: Exception) { /* selection not critical */ }
 
-        Log.d(TAG, "⌨️ PIN write via ACTION_SET_TEXT dirtyLoop cleared=$clearedOk result=$result")
+        Log.d(TAG, "⌨️ PIN single write via ACTION_SET_TEXT result=$result")
         return result
     }
 
@@ -2101,7 +2067,6 @@ class UssdAccessibilityService : AccessibilityService() {
         submitDialogSignature = mySignature
         scheduledStepOrder = step.order
         val scheduledSession = ussdSessionToken
-        var submitAttempt = 0
         lateinit var submitRunnable: Runnable
         awaitingScheduledSubmit = true
         submitRunnable = Runnable {
@@ -2123,17 +2088,9 @@ class UssdAccessibilityService : AccessibilityService() {
                 // Never press Send while the dialog input is still empty — carriers
                 // answer "Input required. Try again" and the whole order dies.
                 val verified = isStepValueCommitted(rt, response, responseKind)
-                Log.i(TAG, "USSD[step=${step.order}] VERIFY ${if (verified) "ok" else "retry"} value='$response'")
+                Log.i(TAG, "USSD[step=${step.order}] VERIFY ${if (verified) "ok" else "failed"} value='$response'")
                 if (!verified) {
-                    submitAttempt++
-                    if (submitAttempt <= 1) {
-                        Log.w(TAG, "⏳ Field not committed yet (attempt $submitAttempt) — retyping '$response' and waiting")
-                        typeIntoActiveEditableField(rt, response)
-                        handler.postDelayed(submitRunnable, RECHECK_DELAY_MS)
-                        rescheduled = true
-                        return@Runnable
-                    }
-                    Log.e(TAG, "🛑 USSD[step=${step.order}] VERIFY failed after one rewrite — Send blocked")
+                    Log.e(TAG, "🛑 USSD[step=${step.order}] VERIFY failed — Send blocked; value will not be cleared or rewritten")
                     return@Runnable
                 }
                 var sendClicked = clickSendOrOkButton(rt, allowScheduledSubmit = true, source = "flow-step-${step.order}") ||
@@ -2240,54 +2197,26 @@ class UssdAccessibilityService : AccessibilityService() {
         return true
     }
 
-    /** Re-write [value] into the currently active editable field (SET_TEXT + paste fallback). */
+    /** Write [value] exactly once into the active field. No clear/rewrite/fallback chain. */
     private fun typeIntoActiveEditableField(root: AccessibilityNodeInfo, value: String): Boolean {
         val candidates = collectEditableFieldCandidates(root)
         return try {
             val best = selectBestEditableCandidate(candidates) ?: return false
             val node = best.node
-            clearEditableField(node)
             focusEditableField(node)
             val args = android.os.Bundle().apply {
                 putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
             }
             val setTextAccepted = try { node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args) } catch (_: Exception) { false }
             try { SystemClock.sleep(160L) } catch (_: Exception) {}
-            var visibleText = readActiveEditableFieldText(root)
-            var committed = isVisibleTextEquivalentToExpected(visibleText, value)
-            var pasteAccepted = false
-            if (!committed) {
-                pasteAccepted = try {
-                    val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                    cm.setPrimaryClip(android.content.ClipData.newPlainText("ussd_value", value))
-                    clearEditableField(node)
-                    node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                    node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-                } catch (_: Exception) { false }
-                try { SystemClock.sleep(180L) } catch (_: Exception) {}
-                visibleText = readActiveEditableFieldText(root)
-                committed = isVisibleTextEquivalentToExpected(visibleText, value)
-            }
-
-            // The IME gesture path is dangerous when an accessibility write already
-            // succeeded: a stale node read can make us type the same value a second
-            // time. Use it only when both accessibility methods were rejected or the
-            // freshly queried field is definitely still empty.
-            var imeAccepted = false
-            if (!committed && (!setTextAccepted && !pasteAccepted || visibleText.isBlank()) &&
-                value.any { it.isDigit() || it == '.' || it == ',' }
-            ) {
-                imeAccepted = writeWithVisibleImeText(root, value)
-                try { SystemClock.sleep(180L) } catch (_: Exception) {}
-                visibleText = readActiveEditableFieldText(root)
-                committed = isVisibleTextEquivalentToExpected(visibleText, value)
-            }
+            val visibleText = readActiveEditableFieldText(root)
+            val committed = isVisibleTextEquivalentToExpected(visibleText, value)
             setTextSuppressUntilMs = System.currentTimeMillis() + 1500L
             Log.d(
                 TAG,
-                "USSD WRITE result committed=$committed setText=$setTextAccepted paste=$pasteAccepted ime=$imeAccepted visibleLen=${visibleText.length}"
+                "USSD WRITE ONCE result committed=$committed setText=$setTextAccepted visibleLen=${visibleText.length}"
             )
-            committed || (visibleText.isBlank() && (setTextAccepted || pasteAccepted || imeAccepted))
+            committed || (visibleText.isBlank() && setTextAccepted)
         } finally {
             candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
         }
