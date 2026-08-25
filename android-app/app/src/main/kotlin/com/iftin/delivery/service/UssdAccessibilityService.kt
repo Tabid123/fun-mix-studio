@@ -637,11 +637,20 @@ class UssdAccessibilityService : AccessibilityService() {
         return kotlin.math.abs(actualNumber - expectedNumber) < 0.000001
     }
 
+    private fun isReceiverCommittedInActiveField(root: AccessibilityNodeInfo, expected: String): Boolean {
+        val expectedDigits = expected.filter { it.isDigit() }
+        if (expectedDigits.isBlank()) return false
+        val actualDigits = readActiveEditableFieldText(root).filter { it.isDigit() }
+        // Receiver verification must be strict. Do not trust masked/empty fields here;
+        // otherwise Somnet can press Send on "Fadlan Hubi Mobilka" without the number.
+        return actualDigits == expectedDigits
+    }
+
     private fun isStepValueCommitted(root: AccessibilityNodeInfo, expected: String, kind: FlowResponseKind): Boolean {
-        return if (kind == FlowResponseKind.AMOUNT) {
-            isAmountCommittedInActiveField(root, expected)
-        } else {
-            isValueCommittedInActiveField(root, expected)
+        return when (kind) {
+            FlowResponseKind.AMOUNT -> isAmountCommittedInActiveField(root, expected)
+            FlowResponseKind.RECEIVER -> isReceiverCommittedInActiveField(root, expected)
+            else -> isValueCommittedInActiveField(root, expected)
         }
     }
 
@@ -1365,6 +1374,13 @@ class UssdAccessibilityService : AccessibilityService() {
             }?.let { return it }
             pending.firstOrNull { flowResponseKind(it) == FlowResponseKind.RECEIVER && flowStepMatchesContent(it, dialogText) }
                 ?.let { return it }
+            // Somnet's "Fadlan Hubi Mobilka" is always a receiver re-entry prompt.
+            // Some remote flows only define the first receiver step, so after that
+            // step is marked complete there may be no pending receiver step left.
+            // Still claim the dialog for the receiver writer so generic Send cannot
+            // submit it empty.
+            pending.firstOrNull { flowResponseKind(it) == FlowResponseKind.RECEIVER }?.let { return it }
+            flow.steps.lastOrNull { flowResponseKind(it) == FlowResponseKind.RECEIVER }?.let { return it }
         }
         return pending.firstOrNull { flowStepMatchesContent(it, dialogText) }
     }
@@ -1970,6 +1986,10 @@ class UssdAccessibilityService : AccessibilityService() {
                         }
                 } ?: unansweredSteps.firstOrNull {
                     flowResponseKind(it) == FlowResponseKind.RECEIVER && flowStepMatchesContent(it, dialogText)
+                } ?: unansweredSteps.firstOrNull {
+                    flowResponseKind(it) == FlowResponseKind.RECEIVER
+                } ?: flow.steps.lastOrNull {
+                    flowResponseKind(it) == FlowResponseKind.RECEIVER
                 }
             } else null
         } ?: unansweredSteps.firstOrNull { flowStepMatchesContent(it, dialogText) }
@@ -2145,6 +2165,7 @@ class UssdAccessibilityService : AccessibilityService() {
         val scheduledSession = ussdSessionToken
         lateinit var submitRunnable: Runnable
         awaitingScheduledSubmit = true
+        var verifyAttempt = 0
         submitRunnable = Runnable {
             val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
             var rescheduled = false
@@ -2158,7 +2179,10 @@ class UssdAccessibilityService : AccessibilityService() {
                     Log.w(TAG, "🚫 Stale submit dropped — dialog changed (was='${mySignature.take(24)}' now='${liveSignature.take(24)}')")
                     return@Runnable
                 }
-                if (step.order in completedFlowSteps) {
+                val liveDialogText = extractDialogText(rt)
+                val isReceiverConfirmationRepeat = responseKind == FlowResponseKind.RECEIVER &&
+                    dialogLooksLikeReceiverConfirmationPrompt(liveDialogText)
+                if (step.order in completedFlowSteps && !isReceiverConfirmationRepeat) {
                     Log.w(TAG, "🚫 Stale submit dropped — step ${step.order} already completed")
                     return@Runnable
                 }
@@ -2167,7 +2191,13 @@ class UssdAccessibilityService : AccessibilityService() {
                 val verified = isStepValueCommitted(rt, response, responseKind)
                 Log.i(TAG, "USSD[step=${step.order}] VERIFY ${if (verified) "ok" else "failed"} value='$response'")
                 if (!verified) {
-                    Log.e(TAG, "🛑 USSD[step=${step.order}] VERIFY failed — Send blocked; value will not be cleared or rewritten")
+                    if ((responseKind == FlowResponseKind.RECEIVER || responseKind == FlowResponseKind.AMOUNT) && ++verifyAttempt <= 6) {
+                        Log.w(TAG, "⏳ USSD[step=${step.order}] VERIFY pending attempt=$verifyAttempt — Send blocked until value is visible")
+                        handler.postDelayed(submitRunnable, RECHECK_DELAY_MS)
+                        rescheduled = true
+                    } else {
+                        Log.e(TAG, "🛑 USSD[step=${step.order}] VERIFY failed — Send blocked; value will not be cleared or rewritten")
+                    }
                     return@Runnable
                 }
                 var sendClicked = clickSendOrOkButton(rt, allowScheduledSubmit = true, source = "flow-step-${step.order}") ||
@@ -2308,7 +2338,7 @@ class UssdAccessibilityService : AccessibilityService() {
                     return@Runnable
                 }
                 if (!hasVisibleEditableInput(rt)) {
-                    if (++attempt <= 4) {
+                    if (++attempt <= 8) {
                         Log.i(TAG, "⏳ USSD[step=${step.order}] waiting for EditText attempt=$attempt")
                         handler.postDelayed(retryRunnable, RECHECK_DELAY_MS)
                         rescheduled = true
