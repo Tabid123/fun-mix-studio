@@ -1330,6 +1330,36 @@ class UssdAccessibilityService : AccessibilityService() {
         return step.keywords.any { keyword -> keyword.isNotBlank() && lower.contains(keyword.lowercase()) }
     }
 
+    private fun normalizeMenuLabel(value: String): String = value.lowercase()
+        .replace(Regex("^\\s*\\$?\\d+(?:[.,]\\d+)?\\s*=\\s*"), "")
+        .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+    private fun resolveMenuChoice(dialogText: String, keywords: List<String>, fallback: String): String {
+        val flattened = dialogText.replace(Regex("\\s+\\|\\s+"), "\n")
+        val rowRegex = Regex("(?m)^\\s*(\\d+)\\s*(?:[.)\\-:]\\s*|\\s+)(.+?)\\s*$")
+        val rows = rowRegex.findAll(flattened).map { it.groupValues[1] to normalizeMenuLabel(it.groupValues[2]) }.toList()
+        if (rows.isEmpty()) return fallback
+        val groups = keywords.flatMap { it.split(';') }
+            .map(::normalizeMenuLabel)
+            .filter { it.isNotBlank() && it !in setOf("menu", "xulo", "dooro", "select") }
+        for (group in groups) {
+            val tokens = group.split(' ').filter(String::isNotBlank)
+            val exact = rows.firstOrNull { (_, label) -> label == group }
+            if (exact != null) return exact.first
+            val allTokens = rows.firstOrNull { (_, label) -> tokens.isNotEmpty() && tokens.all { token ->
+                Regex("(?<![\\w.])${Regex.escape(token)}(?![\\w.])").containsMatchIn(label)
+            } }
+            if (allTokens != null) return allTokens.first
+            if (tokens.size >= 3) {
+                val fuzzy = rows.firstOrNull { (_, label) -> tokens.count { label.contains(it) } >= tokens.size - 1 }
+                if (fuzzy != null) return fuzzy.first
+            }
+        }
+        return fallback.ifBlank { "1" }
+    }
+
     private fun matchingPendingStep(dialogText: String): UssdFlowsClient.FlowStep? {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val flow = try {
@@ -1958,6 +1988,11 @@ class UssdAccessibilityService : AccessibilityService() {
         // Tolerate admin entries like "{5516}", "{2}", "{1}" — strip remaining
         // braces around literal values so they're typed as the value, not "{value}".
         response = response.replace(Regex("\\{([^{}]*)\\}"), "$1").trim()
+        val responseKind = flowResponseKind(step)
+        if (responseKind == FlowResponseKind.MENU_CHOICE && isMenuList) {
+            response = resolveMenuChoice(dialogText, step.keywords, response)
+            Log.i(TAG, "USSD[step=${step.order}] MENU resolved choice='$response'")
+        }
 
         val attemptKey = "${step.order}:$response:${dialogSignature(root).take(80)}"
         val attemptNow = System.currentTimeMillis()
@@ -2029,8 +2064,6 @@ class UssdAccessibilityService : AccessibilityService() {
             Log.w(TAG, "⚠️ Failed to type flow response into EditText")
             return false
         }
-        val responseKind = flowResponseKind(step)
-
         // Keep a short marker for potential SET_TEXT echo events only.
         // onAccessibilityEvent no longer suppresses TYPE_WINDOW_STATE_CHANGED using this,
         // so the next USSD screen can still be processed immediately.
@@ -2140,6 +2173,8 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         val signature = dialogSignature(rootInActiveWindow)
         submitDialogSignature = signature
+        scheduledStepOrder = stepOrder
+        val scheduledSession = ussdSessionToken
         awaitingScheduledSubmit = true
         var attempt = 0
         lateinit var runnable: Runnable
@@ -2149,14 +2184,15 @@ class UssdAccessibilityService : AccessibilityService() {
             try {
                 val liveSignature = dialogSignature(rt)
                 val expectedOrderNow = (completedFlowSteps.maxOrNull() ?: 0) + 1
-                if ((signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) ||
-                    expectedOrderNow != stepOrder
+                if (scheduledSession != ussdSessionToken ||
+                    (signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) ||
+                    stepOrder in completedFlowSteps
                 ) {
                     Log.w(TAG, "🚫 Numbered-menu click dropped — dialog or step changed")
                     return@Runnable
                 }
                 if (clickNumberedMenuOption(rt, response)) {
-                    completedFlowSteps.add(stepOrder)
+                    markFlowStepCompleted(stepOrder)
                     submitCount++
                     reportFlowProgress(
                         stepOrder = stepOrder,
@@ -2180,6 +2216,7 @@ class UssdAccessibilityService : AccessibilityService() {
                     scheduledSubmitRunnable = null
                     awaitingScheduledSubmit = false
                     submitDialogSignature = ""
+                    scheduledStepOrder = -1
                 }
                 try { rt.recycle() } catch (_: Exception) {}
             }
