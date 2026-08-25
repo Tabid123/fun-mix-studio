@@ -1933,6 +1933,18 @@ class UssdAccessibilityService : AccessibilityService() {
                     flowResponseKind(it) == FlowResponseKind.MENU_CHOICE && flowStepMatchesContent(it, dialogText)
                 }
             } else null
+        } ?: run {
+            if (dialogLooksLikeReceiverConfirmationPrompt(dialogText)) {
+                unansweredSteps.firstOrNull {
+                    flowResponseKind(it) == FlowResponseKind.RECEIVER &&
+                        it.keywords.any { kw ->
+                            val k = kw.lowercase()
+                            k.contains("hubi") || k.contains("confirm") || k.contains("xaqiiji")
+                        }
+                } ?: unansweredSteps.firstOrNull {
+                    flowResponseKind(it) == FlowResponseKind.RECEIVER && flowStepMatchesContent(it, dialogText)
+                }
+            } else null
         } ?: unansweredSteps.firstOrNull { flowStepMatchesContent(it, dialogText) }
         if (step == null) {
             Log.d(TAG, "ℹ️ Flow ${flow.triggerCode}: no step matched. completed=$completedFlowSteps dialog=${dialogText.take(120)}")
