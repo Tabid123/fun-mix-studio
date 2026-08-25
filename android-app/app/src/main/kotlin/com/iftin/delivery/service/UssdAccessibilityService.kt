@@ -1297,7 +1297,9 @@ class UssdAccessibilityService : AccessibilityService() {
         if (looksLikePackageMenu(dialogText) && step.order == 1 &&
             step.keywords.any { it.equals("data", true) || it.equals("xogta", true) }
         ) return false
-        return step.keywords.any { keyword -> keyword.isNotBlank() && lower.contains(keyword.lowercase()) }
+        // Ignore single-character keywords (e.g. "1") — they match almost every
+        // dialog that contains a digit and cause steps to fire on the wrong screen.
+        return step.keywords.any { keyword -> keyword.length >= 2 && lower.contains(keyword.lowercase()) }
     }
 
     private fun normalizeMenuLabel(value: String): String = value.lowercase()
@@ -1336,7 +1338,9 @@ class UssdAccessibilityService : AccessibilityService() {
                 if (fuzzy != null) return fuzzy.first
             }
         }
-        return fallback.ifBlank { "1" }
+        // Never invent a choice: if nothing matched and no fallback was configured,
+        // return blank so the caller aborts instead of typing a guessed "1".
+        return fallback
     }
 
     private fun matchingPendingStep(dialogText: String): UssdFlowsClient.FlowStep? {
@@ -1969,7 +1973,10 @@ class UssdAccessibilityService : AccessibilityService() {
         // braces around literal values so they're typed as the value, not "{value}".
         response = response.replace(Regex("\\{([^{}]*)\\}"), "$1").trim()
         val responseKind = flowResponseKind(step)
-        if (responseKind == FlowResponseKind.MENU_CHOICE && isMenuList) {
+        // Admin-configured literal (e.g. "3") always wins — type exactly what the
+        // flow says. Keyword-based row resolution is only a fallback for when the
+        // template was left blank.
+        if (responseKind == FlowResponseKind.MENU_CHOICE && isMenuList && response.isBlank()) {
             response = resolveMenuChoice(dialogText, step.keywords, response)
             Log.i(TAG, "USSD[step=${step.order}] MENU resolved choice='$response'")
         }
@@ -2707,6 +2714,15 @@ class UssdAccessibilityService : AccessibilityService() {
         // can fire before the value is typed (the Somnet symptom).
         if (awaitingScheduledSubmit) {
             Log.i(TAG, "🛑 Suppressing auto-click — scheduled submit is pending")
+            return true
+        }
+
+        // If this dialog matches a pending flow step, the dynamic flow handler owns
+        // it. Never let the generic loop press Send — Somnet opens dialogs whose
+        // EditText is not yet in the accessibility tree, so the "empty field" check
+        // below can't see it and Send fires with nothing typed ("Input required").
+        if (!dialogText.isNullOrBlank() && matchingPendingStep(dialogText) != null) {
+            Log.i(TAG, "🛑 Suppressing auto-click — pending flow step owns this dialog")
             return true
         }
         if (shouldHardStopForPinStage(root, dialogText)) {
