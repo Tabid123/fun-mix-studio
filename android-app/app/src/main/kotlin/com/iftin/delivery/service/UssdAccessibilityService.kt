@@ -1297,7 +1297,9 @@ class UssdAccessibilityService : AccessibilityService() {
         if (looksLikePackageMenu(dialogText) && step.order == 1 &&
             step.keywords.any { it.equals("data", true) || it.equals("xogta", true) }
         ) return false
-        return step.keywords.any { keyword -> keyword.isNotBlank() && lower.contains(keyword.lowercase()) }
+        // Ignore single-character keywords (e.g. "1") — they match almost every
+        // dialog that contains a digit and cause steps to fire on the wrong screen.
+        return step.keywords.any { keyword -> keyword.length >= 2 && lower.contains(keyword.lowercase()) }
     }
 
     private fun normalizeMenuLabel(value: String): String = value.lowercase()
