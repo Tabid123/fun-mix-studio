@@ -1968,7 +1968,7 @@ class UssdAccessibilityService : AccessibilityService() {
         // Prevents Somnet "Invalid PIN format" loops where the carrier re-prompts.
         if (step.isPinField && pinFilledForSession) {
             if (pinSubmittedForSession) {
-                completedFlowSteps.add(step.order)
+                markFlowStepCompleted(step.order)
                 Log.d(TAG, "⏭️ Flow PIN step #${step.order} already submitted this session; marking complete")
             } else {
                 Log.d(TAG, "⏭️ Flow PIN step #${step.order} already filled and awaiting scheduled submit")
