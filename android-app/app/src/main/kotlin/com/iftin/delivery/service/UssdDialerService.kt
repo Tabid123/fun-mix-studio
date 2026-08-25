@@ -1842,25 +1842,32 @@ class UssdDialerService : Service() {
             
             val searchName = providerName.lowercase(Locale.getDefault())
             
-            // Define flexible patterns for each provider
-            val patterns = when (searchName) {
-                "hormuud" -> listOf("hormuud", "hor", "hmd", "hormud")
-                "somnet" -> listOf("somnet", "som", "somalink")
-                "somtel" -> listOf("somtel", "tel")
-                "amtel" -> listOf("amtel", "amt")
-                else -> listOf(searchName)
+            // Match the full provider name across every SIM before trying aliases.
+            // In particular, "tel" is not a safe Somtel alias: it can match Telesom
+            // or another SIM label and launch *300# on the wrong network.
+            val aliases = when (searchName) {
+                "hormuud" -> listOf("hormud", "hmd", "hor")
+                "somnet" -> listOf("somalink", "som")
+                "somtel" -> emptyList()
+                "amtel" -> listOf("amt")
+                else -> emptyList()
             }
+            val patterns = listOf(searchName) + aliases
             
             android.util.Log.d("UssdDialer", "🔍 Searching with patterns: ${patterns.joinToString()} among ${subscriptionInfoList.size} SIMs")
             
-            for (info in subscriptionInfoList) {
-                val carrierName = info.carrierName?.toString()?.lowercase(Locale.getDefault()) ?: ""
-                val displayName = info.displayName?.toString()?.lowercase(Locale.getDefault()) ?: ""
-                
+            subscriptionInfoList.forEach { info ->
+                val carrierName = info.carrierName?.toString()?.lowercase(Locale.getDefault()).orEmpty()
+                val displayName = info.displayName?.toString()?.lowercase(Locale.getDefault()).orEmpty()
                 android.util.Log.d("UssdDialer", "📱 Slot ${info.simSlotIndex}: carrier='$carrierName', display='$displayName', subId=${info.subscriptionId}")
-                
-                // Check if ANY pattern matches
-                for (pattern in patterns) {
+            }
+
+            // Pattern-first ordering guarantees an exact "somtel" match on any SIM
+            // wins before a loose alias can match a different SIM earlier in the list.
+            for (pattern in patterns) {
+                for (info in subscriptionInfoList) {
+                    val carrierName = info.carrierName?.toString()?.lowercase(Locale.getDefault()).orEmpty()
+                    val displayName = info.displayName?.toString()?.lowercase(Locale.getDefault()).orEmpty()
                     if (carrierName.contains(pattern) || displayName.contains(pattern)) {
                         android.util.Log.d("UssdDialer", "✅ MATCHED pattern '$pattern' in slot ${info.simSlotIndex}")
                         return info.subscriptionId
