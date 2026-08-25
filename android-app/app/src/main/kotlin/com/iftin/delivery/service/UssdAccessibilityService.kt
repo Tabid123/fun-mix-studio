@@ -1982,13 +1982,10 @@ class UssdAccessibilityService : AccessibilityService() {
         }
 
         val attemptKey = "${step.order}:$response:${dialogSignature(root).take(80)}"
-        val attemptNow = System.currentTimeMillis()
         if (attemptKey == lastAttemptKey) {
             Log.i(TAG, "USSD[step=${step.order}] duplicate write permanently suppressed for this dialog")
             return true
         }
-        lastAttemptKey = attemptKey
-        lastAttemptAtMs = attemptNow
 
         if (response.isBlank()) {
             Log.w(TAG, "⚠️ Flow step #${step.order} matched but response is empty")
@@ -2009,6 +2006,8 @@ class UssdAccessibilityService : AccessibilityService() {
                 Log.w(TAG, "⚠️ Flow PIN step #${step.order} write skipped/failed")
                 return false
             }
+            lastAttemptKey = attemptKey
+            lastAttemptAtMs = System.currentTimeMillis()
             reportFlowProgress(
                 stepOrder = step.order,
                 totalSteps = flow.steps.size,
@@ -2043,14 +2042,23 @@ class UssdAccessibilityService : AccessibilityService() {
             ) {
                 return true
             }
-            Log.w(TAG, "⚠️ Flow step matched but no EditText to type into")
-            return false
+            Log.w(TAG, "⏳ Flow step #${step.order} matched but EditText is not ready yet — scheduling input-field retry")
+            return scheduleInputFieldRetry(
+                step = step,
+                totalSteps = flow.steps.size,
+                response = response,
+                responseKind = responseKind,
+                dialogText = dialogText,
+                signature = dialogSignature(root)
+            )
         }
 
         if (!typeIntoActiveEditableField(root, response)) {
             Log.w(TAG, "⚠️ Failed to type flow response into EditText")
             return false
         }
+        lastAttemptKey = attemptKey
+        lastAttemptAtMs = System.currentTimeMillis()
         // Keep a short marker for potential SET_TEXT echo events only.
         // onAccessibilityEvent no longer suppresses TYPE_WINDOW_STATE_CHANGED using this,
         // so the next USSD screen can still be processed immediately.
@@ -2201,6 +2209,72 @@ class UssdAccessibilityService : AccessibilityService() {
         }
         scheduledSubmitRunnable = runnable
         handler.postDelayed(runnable, RECHECK_DELAY_MS)
+        return true
+    }
+
+    /**
+     * Some Somnet dialogs expose the prompt text before the EditText is present in
+     * the accessibility tree. Wait for the same dialog's input field, then let the
+     * normal single-write path run once. This prevents both empty Send and rewrites.
+     */
+    private fun scheduleInputFieldRetry(
+        step: UssdFlowsClient.FlowStep,
+        totalSteps: Int,
+        response: String,
+        responseKind: FlowResponseKind,
+        dialogText: String,
+        signature: String
+    ): Boolean {
+        scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+        submitDialogSignature = signature
+        scheduledStepOrder = step.order
+        val scheduledSession = ussdSessionToken
+        awaitingScheduledSubmit = true
+        var attempt = 0
+        lateinit var retryRunnable: Runnable
+        retryRunnable = Runnable {
+            val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
+            var rescheduled = false
+            try {
+                val liveSignature = dialogSignature(rt)
+                if (scheduledSession != ussdSessionToken ||
+                    (signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) ||
+                    step.order in completedFlowSteps
+                ) {
+                    Log.w(TAG, "🚫 Input-field retry dropped — dialog or step changed")
+                    return@Runnable
+                }
+                if (!hasVisibleEditableInput(rt)) {
+                    if (++attempt <= 4) {
+                        Log.i(TAG, "⏳ USSD[step=${step.order}] waiting for EditText attempt=$attempt")
+                        handler.postDelayed(retryRunnable, RECHECK_DELAY_MS)
+                        rescheduled = true
+                    } else {
+                        Log.e(TAG, "USSD[step=${step.order}] EditText never became ready; no value sent")
+                    }
+                    return@Runnable
+                }
+
+                scheduledSubmitRunnable = null
+                awaitingScheduledSubmit = false
+                submitDialogSignature = ""
+                scheduledStepOrder = -1
+                val liveText = extractDialogText(rt) ?: dialogText
+                if (!tryHandleDynamicFlow(rt, liveText)) {
+                    Log.w(TAG, "USSD[step=${step.order}] input retry found field but flow handler did not write responseKind=$responseKind totalSteps=$totalSteps")
+                }
+            } finally {
+                if (!rescheduled && scheduledSubmitRunnable === retryRunnable) {
+                    scheduledSubmitRunnable = null
+                    awaitingScheduledSubmit = false
+                    submitDialogSignature = ""
+                    scheduledStepOrder = -1
+                }
+                try { rt.recycle() } catch (_: Exception) {}
+            }
+        }
+        scheduledSubmitRunnable = retryRunnable
+        handler.postDelayed(retryRunnable, RECHECK_DELAY_MS)
         return true
     }
 
