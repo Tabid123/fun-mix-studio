@@ -209,7 +209,7 @@ class UssdAccessibilityService : AccessibilityService() {
             "dialpad", "digits", "keypad", "dialButton", "one", "two", "three",
             "zero", "deleteButton", "searchview"
         )
-        private const val MAX_PIN_REWRITE_ATTEMPTS = 4
+        private const val MAX_PIN_REWRITE_ATTEMPTS = 1
         private const val MULTI_DIALOG_TIMEOUT_MS = 10000L
     }
     
@@ -461,6 +461,7 @@ class UssdAccessibilityService : AccessibilityService() {
         scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
         awaitingScheduledSubmit = true
         val pinSignature = dialogSignature(rootInActiveWindow)
+        val scheduledSession = ussdSessionToken
         submitDialogSignature = pinSignature
         lateinit var rRef: Runnable
         val r = Runnable {
@@ -468,7 +469,9 @@ class UssdAccessibilityService : AccessibilityService() {
             try {
                 // Stale-dialog guard: never write/send into a dialog that already changed.
                 val liveSignature = dialogSignature(rt)
-                if (pinSignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != pinSignature) {
+                if (scheduledSession != ussdSessionToken ||
+                    pinSignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != pinSignature
+                ) {
                     Log.w(TAG, "🚫 submitPinOnce[$source] dropped — dialog changed")
                     return@Runnable
                 }
@@ -495,23 +498,8 @@ class UssdAccessibilityService : AccessibilityService() {
                             submitPinOnce(delayMs = 1200L, source = "$source-rewrite$pinRewriteAttempts")
                         }
                     } else {
-                        // FINAL FALLBACK (fixes "PIN entered but Send never pressed"):
-                        // after MAX rewrites, if the field visibly holds *something*
-                        // (masked bullets or any text), press Send instead of giving up.
-                        val filledLen = activeFieldFilledLength(rt)
-                        if (filledLen > 0) {
-                            Log.i(TAG, "USSD[$source] SEND fallback — field has data after $pinRewriteAttempts rewrites (len=$filledLen)")
-                            if (clickSendOrOkButton(rt, allowScheduledSubmit = true, source = source)) {
-                                pinSubmittedForSession = true
-                                submitCount++
-                                onSubmitted?.invoke()
-                            } else {
-                                Log.w(TAG, "USSD[$source] SEND failed — no Send/OK button clicked")
-                            }
-                        } else {
-                            pinWriteFailedForSession = true
-                            Log.e(TAG, "❌ submitPinOnce[$source] blocked after $pinRewriteAttempts rewrites — field is truly empty; Send will NOT be clicked")
-                        }
+                        pinWriteFailedForSession = true
+                        Log.e(TAG, "USSD[$source] VERIFY failed after one rewrite — Send blocked; next event may retry safely")
                     }
                     return@Runnable
                 }
@@ -1317,8 +1305,25 @@ class UssdAccessibilityService : AccessibilityService() {
         if (text.isBlank()) return false
         // Count occurrences of "1.", "2)", "1 -", or carrier variants like
         // "1 Haa". 2+ means it is a menu/choice list, not a value prompt.
-        val matches = Regex("(?m)(?:^|\\s)[1-9]\\s*[.)-]?\\s+\\S").findAll(text).count()
+        val flattened = text.replace(Regex("\\s+\\|\\s+"), "\n")
+        val matches = Regex("(?m)(?:^|\\s)[1-9]\\s*(?:[.)\\-:]\\s*|\\s+)\\S").findAll(flattened).count()
         return matches >= 2
+    }
+
+    private fun looksLikePackageMenu(text: String): Boolean {
+        if (!looksLikeNumberedMenu(text)) return false
+        val lower = text.lowercase()
+        return Regex("\\b\\d+\\s*(?:mb|gb)\\b").containsMatchIn(lower) ||
+            listOf("$", "saac", "unlimited", "bundle", "xirmo", "package").any(lower::contains)
+    }
+
+    private fun flowStepMatchesContent(step: UssdFlowsClient.FlowStep, dialogText: String): Boolean {
+        val lower = dialogText.lowercase()
+        if (!isFlowStepCompatibleWithDialog(step, dialogText)) return false
+        if (looksLikePackageMenu(dialogText) && step.order == 1 &&
+            step.keywords.any { it.equals("data", true) || it.equals("xogta", true) }
+        ) return false
+        return step.keywords.any { keyword -> keyword.isNotBlank() && lower.contains(keyword.lowercase()) }
     }
 
     private fun flowResponseKind(step: UssdFlowsClient.FlowStep): FlowResponseKind {
@@ -1485,7 +1490,8 @@ class UssdAccessibilityService : AccessibilityService() {
             // instead of opening a brand-new window, so receiver/amount prompts only
             // arrive as content changes.
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
-                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                AccessibilityEvent.TYPE_WINDOWS_CHANGED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
@@ -1521,7 +1527,7 @@ class UssdAccessibilityService : AccessibilityService() {
         // New USSD session started: reset one-time PIN guards
         if (expectingUssd && lastUssdTime != 0L && lastUssdTime != ussdSessionToken) {
             ussdSessionToken = lastUssdTime
-            resetSessionState("new-session token=$ussdSessionToken")
+            restoreOrStartSessionState(ussdSessionToken)
             Log.d(TAG, "🆕 New USSD session detected token=$ussdSessionToken")
         }
 
@@ -1539,7 +1545,8 @@ class UssdAccessibilityService : AccessibilityService() {
         // ===== HARDENED EVENT FILTERING =====
         // 1. Process only USSD dialog transitions we care about.
         val isRelevantEvent = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-            event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+            event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED
         if (!isRelevantEvent) {
             ignoredEventCount++
             if (ignoredEventCount % 10 == 1) {
