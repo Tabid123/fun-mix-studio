@@ -1982,13 +1982,10 @@ class UssdAccessibilityService : AccessibilityService() {
         }
 
         val attemptKey = "${step.order}:$response:${dialogSignature(root).take(80)}"
-        val attemptNow = System.currentTimeMillis()
         if (attemptKey == lastAttemptKey) {
             Log.i(TAG, "USSD[step=${step.order}] duplicate write permanently suppressed for this dialog")
             return true
         }
-        lastAttemptKey = attemptKey
-        lastAttemptAtMs = attemptNow
 
         if (response.isBlank()) {
             Log.w(TAG, "⚠️ Flow step #${step.order} matched but response is empty")
@@ -2009,6 +2006,8 @@ class UssdAccessibilityService : AccessibilityService() {
                 Log.w(TAG, "⚠️ Flow PIN step #${step.order} write skipped/failed")
                 return false
             }
+            lastAttemptKey = attemptKey
+            lastAttemptAtMs = System.currentTimeMillis()
             reportFlowProgress(
                 stepOrder = step.order,
                 totalSteps = flow.steps.size,
@@ -2051,6 +2050,8 @@ class UssdAccessibilityService : AccessibilityService() {
             Log.w(TAG, "⚠️ Failed to type flow response into EditText")
             return false
         }
+        lastAttemptKey = attemptKey
+        lastAttemptAtMs = System.currentTimeMillis()
         // Keep a short marker for potential SET_TEXT echo events only.
         // onAccessibilityEvent no longer suppresses TYPE_WINDOW_STATE_CHANGED using this,
         // so the next USSD screen can still be processed immediately.
