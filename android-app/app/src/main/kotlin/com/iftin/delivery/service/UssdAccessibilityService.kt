@@ -525,11 +525,42 @@ class UssdAccessibilityService : AccessibilityService() {
         return isValueCommittedInActiveField(root, expected)
     }
 
-    /** Normalized dialog signature — used to bind a scheduled submit to ONE dialog. */
+    /**
+     * Stable prompt signature used to bind a scheduled submit to ONE dialog.
+     *
+     * Do not include EditText content here. ACTION_SET_TEXT changes that content and
+     * emits TYPE_WINDOW_CONTENT_CHANGED; including it made the service mistake its
+     * own write for a new dialog and cancel the pending Send (most visible on
+     * Somnet's final "1. Haa" step).
+     */
     private fun dialogSignature(root: AccessibilityNodeInfo?): String {
         if (root == null) return ""
-        val raw = try { extractDialogText(root) ?: "" } catch (_: Exception) { "" }
-        return raw.lowercase().replace(Regex("[^a-z]"), "").take(60)
+        val promptParts = mutableListOf<String>()
+        fun collectPromptText(node: AccessibilityNodeInfo) {
+            try {
+                val className = node.className?.toString().orEmpty()
+                val editable = node.isEditable || className.contains("EditText", ignoreCase = true)
+                if (editable) return
+
+                node.text?.toString()?.trim()?.takeIf { it.isNotBlank() }?.let(promptParts::add)
+                node.contentDescription?.toString()?.trim()
+                    ?.takeIf { it.isNotBlank() && it != node.text?.toString()?.trim() }
+                    ?.let(promptParts::add)
+
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { child ->
+                        try { collectPromptText(child) } finally { child.recycle() }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        try { collectPromptText(root) } catch (_: Exception) {}
+        return promptParts.joinToString(" ")
+            .lowercase()
+            .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .take(180)
     }
 
     /** Digits/decimal-only form so "0.01", "0,01", " 0.01 " all compare equal. */
@@ -1479,16 +1510,25 @@ class UssdAccessibilityService : AccessibilityService() {
         }
 
         val pinCheckRoot = rootInActiveWindow
-        val eventDialogText = event.text
-            ?.mapNotNull { it?.toString() }
-            ?.joinToString(" | ")
-            ?.takeIf { it.isNotBlank() }
-            ?: pinCheckRoot?.let { extractDialogText(it) }
-        val dialogFingerprint = eventDialogText
-            ?.lowercase()
-            ?.replace(Regex("\\s+"), " ")
-            ?.take(220)
+        // A CONTENT_CHANGED event often contains only the value just typed into the
+        // EditText. Always prefer the complete active dialog for matching/guards.
+        val rootDialogText = pinCheckRoot?.let { extractDialogText(it) }
+        val eventDialogText = rootDialogText
+            ?: event.text
+                ?.mapNotNull { it?.toString() }
+                ?.joinToString(" | ")
+                ?.takeIf { it.isNotBlank() }
+        val dialogFingerprint = pinCheckRoot?.let { dialogSignature(it) }
             .orEmpty()
+            .ifBlank {
+                eventDialogText
+                    ?.lowercase()
+                    ?.replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+                    ?.replace(Regex("\\s+"), " ")
+                    ?.trim()
+                    ?.take(180)
+                    .orEmpty()
+            }
 
         if (shouldHardStopForPinStage(pinCheckRoot, eventDialogText) && !shouldBypassPinHardStop(eventDialogText)) {
             cancelPendingAutoActions("onAccessibilityEvent-pin-top")
@@ -2037,28 +2077,43 @@ class UssdAccessibilityService : AccessibilityService() {
             val args = android.os.Bundle().apply {
                 putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
             }
-            var ok = try { node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args) } catch (_: Exception) { false }
-            try { SystemClock.sleep(80L) } catch (_: Exception) {}
-            try { node.refresh() } catch (_: Exception) {}
-            val directText = node.text?.toString().orEmpty()
-            val needsPaste = !ok || (value.contains('.') && !directText.contains('.'))
-            if (needsPaste) {
-                ok = try {
+            val setTextAccepted = try { node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args) } catch (_: Exception) { false }
+            try { SystemClock.sleep(160L) } catch (_: Exception) {}
+            var visibleText = readActiveEditableFieldText(root)
+            var committed = isVisibleTextEquivalentToExpected(visibleText, value)
+            var pasteAccepted = false
+            if (!committed) {
+                pasteAccepted = try {
                     val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
                     cm.setPrimaryClip(android.content.ClipData.newPlainText("ussd_value", value))
                     clearEditableField(node)
                     node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
                     node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
                 } catch (_: Exception) { false }
+                try { SystemClock.sleep(180L) } catch (_: Exception) {}
+                visibleText = readActiveEditableFieldText(root)
+                committed = isVisibleTextEquivalentToExpected(visibleText, value)
             }
-            try { SystemClock.sleep(120L) } catch (_: Exception) {}
-            try { node.refresh() } catch (_: Exception) {}
-            val afterPaste = node.text?.toString().orEmpty()
-            if ((!ok || !isVisibleTextEquivalentToExpected(afterPaste, value)) && value.any { it.isDigit() || it == '.' || it == ',' }) {
-                ok = writeWithVisibleImeText(root, value) || ok
+
+            // The IME gesture path is dangerous when an accessibility write already
+            // succeeded: a stale node read can make us type the same value a second
+            // time. Use it only when both accessibility methods were rejected or the
+            // freshly queried field is definitely still empty.
+            var imeAccepted = false
+            if (!committed && (!setTextAccepted && !pasteAccepted || visibleText.isBlank()) &&
+                value.any { it.isDigit() || it == '.' || it == ',' }
+            ) {
+                imeAccepted = writeWithVisibleImeText(root, value)
+                try { SystemClock.sleep(180L) } catch (_: Exception) {}
+                visibleText = readActiveEditableFieldText(root)
+                committed = isVisibleTextEquivalentToExpected(visibleText, value)
             }
             setTextSuppressUntilMs = System.currentTimeMillis() + 1500L
-            ok
+            Log.d(
+                TAG,
+                "USSD WRITE result committed=$committed setText=$setTextAccepted paste=$pasteAccepted ime=$imeAccepted visibleLen=${visibleText.length}"
+            )
+            committed || (visibleText.isBlank() && (setTextAccepted || pasteAccepted || imeAccepted))
         } finally {
             candidates.forEach { try { it.node.recycle() } catch (_: Exception) {} }
         }
