@@ -1544,7 +1544,13 @@ class UssdAccessibilityService : AccessibilityService() {
         // 2. SET_TEXT suppression is only for content echoes caused by our own write.
         // Real carrier navigation to the next USSD page must still be handled.
         val now = System.currentTimeMillis()
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED && now < setTextSuppressUntilMs) {
+        val isSameDialogContentEcho = dialogFingerprint.isNotBlank() &&
+            lastDialogFingerprint.isNotBlank() &&
+            dialogFingerprint == lastDialogFingerprint
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
+            now < setTextSuppressUntilMs &&
+            isSameDialogContentEcho
+        ) {
             Log.d(TAG, "🤫 SET_TEXT suppression active (${setTextSuppressUntilMs - now}ms left) — ignoring content echo")
             return
         }
@@ -1635,7 +1641,9 @@ class UssdAccessibilityService : AccessibilityService() {
             // No editable field => carrier is only showing the outcome. Store it as
             // the authoritative FINAL result and dismiss it with OK/Close so the
             // session ends cleanly (no lingering dialog, no stale intermediate text).
-            if (isTerminalResultDialog(source)) {
+            val isUnansweredChoiceDialog = !dialogText.isNullOrBlank() &&
+                (looksLikeNumberedMenu(dialogText) || hasUnansweredChoiceStep(dialogText))
+            if (isTerminalResultDialog(source) && !isUnansweredChoiceDialog) {
                 if (!dialogText.isNullOrBlank()) {
                     saveUssdResponse(dialogText, isFinal = true)
                 }
@@ -1957,17 +1965,14 @@ class UssdAccessibilityService : AccessibilityService() {
             // Try clicking the matching menu option directly instead of pressing
             // Send with nothing selected.
             val shortNumeric = response.length <= 2 && response.all(Char::isDigit)
-            if (shortNumeric && clickNumberedMenuOption(root, response)) {
-                completedFlowSteps.add(step.order)
-                reportFlowProgress(
+            if (shortNumeric && scheduleNumberedMenuOption(
                     stepOrder = step.order,
                     totalSteps = flow.steps.size,
                     keywords = step.keywords,
                     response = response,
-                    dialogText = dialogText.take(200),
-                    isPin = false
+                    dialogText = dialogText
                 )
-                Log.i(TAG, "USSD[step=${step.order}] SEND clicked numbered menu option '$response' (no EditText available)")
+            ) {
                 return true
             }
             Log.w(TAG, "⚠️ Flow step matched but no EditText to type into")
@@ -2012,6 +2017,11 @@ class UssdAccessibilityService : AccessibilityService() {
                 val liveSignature = dialogSignature(rt)
                 if (mySignature.isNotEmpty() && liveSignature.isNotEmpty() && liveSignature != mySignature) {
                     Log.w(TAG, "🚫 Stale submit dropped — dialog changed (was='${mySignature.take(24)}' now='${liveSignature.take(24)}')")
+                    return@Runnable
+                }
+                val expectedOrderNow = (completedFlowSteps.maxOrNull() ?: 0) + 1
+                if (expectedOrderNow != step.order) {
+                    Log.w(TAG, "🚫 Stale submit dropped — flow advanced to step $expectedOrderNow (scheduled=${step.order})")
                     return@Runnable
                 }
                 // Never press Send while the dialog input is still empty — carriers
@@ -2066,6 +2076,69 @@ class UssdAccessibilityService : AccessibilityService() {
         // Unified delay: give the EditText time to commit before pressing Send.
         handler.postDelayed(submitRunnable, SUBMIT_DELAY_MS)
 
+        return true
+    }
+
+    /**
+     * Numbered carrier menus may appear before their rows become clickable. Retry the
+     * exact option on the exact dialog instead of dropping the step after one miss.
+     */
+    private fun scheduleNumberedMenuOption(
+        stepOrder: Int,
+        totalSteps: Int,
+        keywords: List<String>,
+        response: String,
+        dialogText: String
+    ): Boolean {
+        scheduledSubmitRunnable?.let { handler.removeCallbacks(it) }
+        val signature = dialogSignature(rootInActiveWindow)
+        submitDialogSignature = signature
+        awaitingScheduledSubmit = true
+        var attempt = 0
+        lateinit var runnable: Runnable
+        runnable = Runnable {
+            val rt = rootInActiveWindow ?: run { awaitingScheduledSubmit = false; return@Runnable }
+            var rescheduled = false
+            try {
+                val liveSignature = dialogSignature(rt)
+                val expectedOrderNow = (completedFlowSteps.maxOrNull() ?: 0) + 1
+                if ((signature.isNotBlank() && liveSignature.isNotBlank() && signature != liveSignature) ||
+                    expectedOrderNow != stepOrder
+                ) {
+                    Log.w(TAG, "🚫 Numbered-menu click dropped — dialog or step changed")
+                    return@Runnable
+                }
+                if (clickNumberedMenuOption(rt, response)) {
+                    completedFlowSteps.add(stepOrder)
+                    submitCount++
+                    reportFlowProgress(
+                        stepOrder = stepOrder,
+                        totalSteps = totalSteps,
+                        keywords = keywords,
+                        response = response,
+                        dialogText = dialogText.take(200),
+                        isPin = false
+                    )
+                    startMultiDialogListener()
+                    notifyClickComplete()
+                    Log.i(TAG, "USSD[step=$stepOrder] clicked numbered option '$response' on attempt ${attempt + 1}")
+                } else if (++attempt <= 4) {
+                    handler.postDelayed(runnable, RECHECK_DELAY_MS)
+                    rescheduled = true
+                } else {
+                    Log.e(TAG, "USSD[step=$stepOrder] numbered option '$response' was not clickable after $attempt attempts")
+                }
+            } finally {
+                if (!rescheduled && scheduledSubmitRunnable === runnable) {
+                    scheduledSubmitRunnable = null
+                    awaitingScheduledSubmit = false
+                    submitDialogSignature = ""
+                }
+                try { rt.recycle() } catch (_: Exception) {}
+            }
+        }
+        scheduledSubmitRunnable = runnable
+        handler.postDelayed(runnable, RECHECK_DELAY_MS)
         return true
     }
 
