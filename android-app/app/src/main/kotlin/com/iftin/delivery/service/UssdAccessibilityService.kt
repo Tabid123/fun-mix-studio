@@ -1906,6 +1906,43 @@ class UssdAccessibilityService : AccessibilityService() {
             return false
         }
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+        // ===== SOMNET: 1s settle before touching a freshly rendered dialog =====
+        // Somnet re-renders its dialogs after the first paint; acting immediately can
+        // press Send while the input field is still empty. Wait 1s, re-read the tree,
+        // and only then run the normal write -> verify -> send path.
+        val providerName = prefs.getString("current_provider", null)?.lowercase().orEmpty()
+        if (providerName.contains("somnet")) {
+            val settleKey = "$ussdSessionToken|" + dialogSignature(root)
+            if (settleKey != lastSettledDialogKey) {
+                if (settleKey == pendingSettleDialogKey) {
+                    Log.i(TAG, "⏳ Somnet settle already pending for this dialog")
+                    return true
+                }
+                pendingSettleDialogKey = settleKey
+                val settleSession = ussdSessionToken
+                handler.postDelayed({
+                    pendingSettleDialogKey = ""
+                    if (settleSession != ussdSessionToken) return@postDelayed
+                    val rt = rootInActiveWindow ?: return@postDelayed
+                    try {
+                        val liveKey = "$ussdSessionToken|" + dialogSignature(rt)
+                        if (liveKey != settleKey) {
+                            Log.i(TAG, "🚫 Somnet settle dropped — dialog changed")
+                            return@postDelayed
+                        }
+                        lastSettledDialogKey = settleKey
+                        val liveText = extractDialogText(rt) ?: dialogText
+                        tryHandleDynamicFlow(rt, liveText)
+                    } finally {
+                        try { rt.recycle() } catch (_: Exception) {}
+                    }
+                }, SOMNET_DIALOG_SETTLE_MS)
+                Log.i(TAG, "⏱️ Somnet dialog settle scheduled (${SOMNET_DIALOG_SETTLE_MS}ms)")
+                return true
+            }
+        }
+
         // Prefer the explicit flow_id assigned to this provider (admin-configured),
         // fall back to trigger-code lookup for backward compatibility.
         val flowId = prefs.getString("current_ussd_flow_id", null)
