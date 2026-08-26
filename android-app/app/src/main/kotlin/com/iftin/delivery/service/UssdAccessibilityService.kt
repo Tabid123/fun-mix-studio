@@ -195,6 +195,9 @@ class UssdAccessibilityService : AccessibilityService() {
         // Every step (PIN or non-PIN, Somtel/Somnet/Amtel/Hormuud) uses the SAME
         // write -> verify -> send delays. No provider-specific timing.
         private const val SUBMIT_DELAY_MS = 350L
+        // Somnet re-renders its dialogs; give every Somnet dialog 1s to settle before
+        // writing/sending so Send is never pressed on an empty field.
+        private const val SOMNET_DIALOG_SETTLE_MS = 1000L
         private const val RECHECK_DELAY_MS = 900L
         private const val ATTEMPT_DEBOUNCE_MS = 1200L
         // Legacy aliases kept so existing call sites stay readable.
