@@ -220,6 +220,9 @@ class UssdAccessibilityService : AccessibilityService() {
     private var clickCount = 0
     private var lastClickTime = 0L
     private var lastDialogFingerprint = ""
+    // Somnet dialog settle bookkeeping (see SOMNET_DIALOG_SETTLE_MS).
+    @Volatile private var lastSettledDialogKey = ""
+    @Volatile private var pendingSettleDialogKey = ""
     private var multiDialogRunnable: Runnable? = null
     private var terminalWatcherRunnable: Runnable? = null
 
