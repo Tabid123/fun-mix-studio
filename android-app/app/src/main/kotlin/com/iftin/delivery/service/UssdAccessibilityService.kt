@@ -195,6 +195,9 @@ class UssdAccessibilityService : AccessibilityService() {
         // Every step (PIN or non-PIN, Somtel/Somnet/Amtel/Hormuud) uses the SAME
         // write -> verify -> send delays. No provider-specific timing.
         private const val SUBMIT_DELAY_MS = 350L
+        // Somnet re-renders its dialogs; give every Somnet dialog 1s to settle before
+        // writing/sending so Send is never pressed on an empty field.
+        private const val SOMNET_DIALOG_SETTLE_MS = 1000L
         private const val RECHECK_DELAY_MS = 900L
         private const val ATTEMPT_DEBOUNCE_MS = 1200L
         // Legacy aliases kept so existing call sites stay readable.
@@ -217,6 +220,9 @@ class UssdAccessibilityService : AccessibilityService() {
     private var clickCount = 0
     private var lastClickTime = 0L
     private var lastDialogFingerprint = ""
+    // Somnet dialog settle bookkeeping (see SOMNET_DIALOG_SETTLE_MS).
+    @Volatile private var lastSettledDialogKey = ""
+    @Volatile private var pendingSettleDialogKey = ""
     private var multiDialogRunnable: Runnable? = null
     private var terminalWatcherRunnable: Runnable? = null
 
@@ -388,6 +394,8 @@ class UssdAccessibilityService : AccessibilityService() {
         lastIntendedPinForSession = ""
         pinRewriteAttempts = 0
         completedFlowSteps.clear()
+        lastSettledDialogKey = ""
+        pendingSettleDialogKey = ""
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
             .remove(KEY_COMPLETED_FLOW_STEPS)
             .remove(KEY_FLOW_STATE_SESSION)
@@ -1906,6 +1914,43 @@ class UssdAccessibilityService : AccessibilityService() {
             return false
         }
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+        // ===== SOMNET: 1s settle before touching a freshly rendered dialog =====
+        // Somnet re-renders its dialogs after the first paint; acting immediately can
+        // press Send while the input field is still empty. Wait 1s, re-read the tree,
+        // and only then run the normal write -> verify -> send path.
+        val providerName = prefs.getString("current_provider", null)?.lowercase().orEmpty()
+        if (providerName.contains("somnet")) {
+            val settleKey = "$ussdSessionToken|" + dialogSignature(root)
+            if (settleKey != lastSettledDialogKey) {
+                if (settleKey == pendingSettleDialogKey) {
+                    Log.i(TAG, "⏳ Somnet settle already pending for this dialog")
+                    return true
+                }
+                pendingSettleDialogKey = settleKey
+                val settleSession = ussdSessionToken
+                handler.postDelayed({
+                    pendingSettleDialogKey = ""
+                    if (settleSession != ussdSessionToken) return@postDelayed
+                    val rt = rootInActiveWindow ?: return@postDelayed
+                    try {
+                        val liveKey = "$ussdSessionToken|" + dialogSignature(rt)
+                        if (liveKey != settleKey) {
+                            Log.i(TAG, "🚫 Somnet settle dropped — dialog changed")
+                            return@postDelayed
+                        }
+                        lastSettledDialogKey = settleKey
+                        val liveText = extractDialogText(rt) ?: dialogText
+                        tryHandleDynamicFlow(rt, liveText)
+                    } finally {
+                        try { rt.recycle() } catch (_: Exception) {}
+                    }
+                }, SOMNET_DIALOG_SETTLE_MS)
+                Log.i(TAG, "⏱️ Somnet dialog settle scheduled (${SOMNET_DIALOG_SETTLE_MS}ms)")
+                return true
+            }
+        }
+
         // Prefer the explicit flow_id assigned to this provider (admin-configured),
         // fall back to trigger-code lookup for backward compatibility.
         val flowId = prefs.getString("current_ussd_flow_id", null)
