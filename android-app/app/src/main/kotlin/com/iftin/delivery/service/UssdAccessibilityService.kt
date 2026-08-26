@@ -191,17 +191,22 @@ class UssdAccessibilityService : AccessibilityService() {
         // Timeout for expecting USSD flag (30 seconds - INCREASED from 15s)
         private const val EXPECTING_USSD_TIMEOUT_MS = 30000L
         private const val DEBOUNCE_MS = 400L
-        // ===== UNIFIED TIMING (one behaviour for ALL providers) =====
-        // Every step (PIN or non-PIN, Somtel/Somnet/Amtel/Hormuud) uses the SAME
-        // write -> verify -> send delays. No provider-specific timing.
-        private const val SUBMIT_DELAY_MS = 350L
-        // Somnet re-renders its dialogs; give every Somnet dialog 1s to settle before
-        // writing/sending so Send is never pressed on an empty field.
-        private const val SOMNET_DIALOG_SETTLE_MS = 1000L
+        // ===== UNIFIED PATTERN: WRITE -> WAIT -> VERIFY -> SEND =====
+        // Every step (PIN or non-PIN, Somtel/Somnet/Amtel/Hormuud) follows the SAME
+        // pattern: write once, wait for the field to commit, verify the exact value,
+        // only then press Send. No provider-specific behaviour.
+        // WAIT stage: time between the single write and the first verify.
+        private const val WRITE_WAIT_MS = 1000L
+        private const val SUBMIT_DELAY_MS = WRITE_WAIT_MS
+        // Dialog settle: every dialog gets 1s to finish re-rendering before we write.
+        private const val DIALOG_SETTLE_MS = 1000L
+        private const val SOMNET_DIALOG_SETTLE_MS = DIALOG_SETTLE_MS
+        // VERIFY stage: delay between verify attempts when the value is not visible yet.
         private const val RECHECK_DELAY_MS = 900L
+        private const val MAX_VERIFY_ATTEMPTS = 6
         private const val ATTEMPT_DEBOUNCE_MS = 1200L
         // Legacy aliases kept so existing call sites stay readable.
-        private const val CLICK_DELAY_MS = SUBMIT_DELAY_MS
+        private const val CLICK_DELAY_MS = 350L
         private const val NON_PIN_SUBMIT_DELAY_MS = SUBMIT_DELAY_MS
         // Extra wait applied when a scheduled Send finds the input field still empty.
         private const val SUBMIT_RECHECK_DELAY_MS = RECHECK_DELAY_MS
